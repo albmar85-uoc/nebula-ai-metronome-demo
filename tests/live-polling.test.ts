@@ -52,3 +52,22 @@ describe("failed charges (as seen live)", () => {
     expect(e.message).toMatch(/^Payment failed: we couldn't charge your card for the €50\.00 bundle/);
   });
 });
+
+describe("upgrade start (setup option upgradeStart)", () => {
+  it("next_hour starts at the next full hour so this hour's usage is not re-rated; floor keeps the current hour", () => {
+    const now = new Date("2026-09-25T20:37:12Z");
+    expect(H.upgradeStartAt("next_hour", now)).toBe("2026-09-25T21:00:00.000Z");
+    expect(H.upgradeStartAt("floor", now)).toBe("2026-09-25T20:00:00.000Z");
+    expect(H.upgradeStartAt("next_hour", new Date("2026-09-25T23:00:00Z"))).toBe("2026-09-26T00:00:00.000Z");
+  });
+});
+
+describe("Free contract never bills overage in Metronome (zero-overage overrides)", () => {
+  const ctx = { ids: { credit_types: { EUR: "eur" }, products: { usage: { input_tokens: "pi", output_tokens: "po", images: "pimg" } } } } as never;
+  it("MULTIPLIER 0 on usage + commit-specific OVERWRITE at list price per product", () => {
+    const o = H.buildZeroOverageOverrides(ctx, "free", "2026-09-25T20:00:00.000Z");
+    expect(o[0]).toMatchObject({ type: "MULTIPLIER", multiplier: 0 });
+    expect(o.slice(1).map(x => [(x as { override_specifiers: { product_id: string }[] }).override_specifiers[0].product_id, (x as { overwrite_rate: { price: number } }).overwrite_rate.price])).toEqual([["pi", 2], ["po", 8], ["pimg", 0.04]]);
+    expect(o.slice(1).every(x => (x as { is_commit_specific: boolean }).is_commit_specific)).toBe(true);
+  });
+});

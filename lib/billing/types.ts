@@ -93,6 +93,8 @@ export interface BillingProvider {
   grantGoodwill(customerId: string, g: { grantId: string; amountEur: number; reason: string; validDays: number }): Promise<Account>;
   /** Soporte: levanta el corte de acceso (webhook de saldo 0 / pago fallido). No crea saldo. */
   unblock(customerId: string): Promise<Account>;
+  /** Admin: archive a demo customer (name must start with "Nebula demo") and forget it locally. */
+  archiveDemoCustomer(customerId: string): Promise<{ archived: string }>;
   getInvoice(customerId: string, invoiceId: string): Promise<Invoice | null>;
 }
 
@@ -105,4 +107,15 @@ export class PaymentFailedError extends Error {
 /** Customer-facing English message for a failed charge; the raw provider error goes to the server log only. */
 export function paymentFailedMessage(what: string) {
   return `Payment failed: we couldn't charge your card for ${what}, so nothing was added to your balance and you haven't been charged. Please check your payment method or try again later.`;
+}
+
+/** Only demo customers created by this app ("Nebula demo …") can be archived from the admin panel. */
+export const DEMO_CUSTOMER_PREFIX = "Nebula demo";
+export const isArchivableDemoCustomer = (name: string | undefined | null) => !!name && name.startsWith(DEMO_CUSTOMER_PREFIX);
+
+/** Metronome Trial accounts allow 5 active customers; at the limit, creates fail (sometimes as a misleading 404). */
+export const DEMO_LIMIT_MESSAGE = "Demo limit reached: this sandbox allows 5 active customers. Archive unused demo customers in Admin and try again.";
+export class DemoLimitError extends Error {
+  readonly code = "demo_limit";
+  constructor(readonly detail?: string) { super(DEMO_LIMIT_MESSAGE); this.name = "DemoLimitError"; }
 }

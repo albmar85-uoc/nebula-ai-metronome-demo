@@ -17,21 +17,23 @@ export type Plan = {
   monthlyCredits: number;
   discount: number; // descuento sobre el uso
   overage: boolean; // si puede pasarse del saldo y pagar a fin de mes
+  /** Metronome "guarantee zero overages" overrides on the contract (setup: PLANS.free.zeroOverageGuarantee). */
+  zeroOverageGuarantee: boolean;
   autoRechargeAllowed: boolean;
   features: string[];
 };
 
 export const PLANS: Record<PlanId, Plan> = {
   free: {
-    id: "free", name: "Free", rank: 0, monthlyFee: 0, monthlyCredits: 5, discount: 0, overage: false, autoRechargeAllowed: false,
+    id: "free", name: "Free", rank: 0, monthlyFee: 0, monthlyCredits: 5, discount: 0, overage: false, zeroOverageGuarantee: true, autoRechargeAllowed: false,
     features: ["€5 in credits per month", "Credits don't roll over", "Access pauses when your balance runs out"],
   },
   pro: {
-    id: "pro", name: "Pro", rank: 1, monthlyFee: 29, monthlyCredits: 30, discount: 0.1, overage: false, autoRechargeAllowed: true,
+    id: "pro", name: "Pro", rank: 1, monthlyFee: 29, monthlyCredits: 30, discount: 0.1, overage: false, zeroOverageGuarantee: false, autoRechargeAllowed: true,
     features: ["€30 in credits per month", "10% off usage", "Optional auto-recharge (top up to €50)"],
   },
   scale: {
-    id: "scale", name: "Scale", rank: 2, monthlyFee: 199, monthlyCredits: 250, discount: 0.2, overage: true, autoRechargeAllowed: true,
+    id: "scale", name: "Scale", rank: 2, monthlyFee: 199, monthlyCredits: 250, discount: 0.2, overage: true, zeroOverageGuarantee: false, autoRechargeAllowed: true,
     features: ["€250 in credits per month", "20% off usage", "Overage billed at month end", "Early charge on usage spikes"],
   },
 };

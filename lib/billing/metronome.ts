@@ -11,7 +11,7 @@ import { loadMetronomeIds, planDisplayName, promotionFromIds } from "./metronome
 import * as H from "./metronome-helpers";
 import type { CreditGrantView, InvoiceView } from "./metronome-types";
 import { lowBalanceLimit, round, usageCost } from "./mock";
-import { PaymentFailedError, paymentFailedMessage } from "./types";
+import { PaymentFailedError, isArchivableDemoCustomer, paymentFailedMessage } from "./types";
 import type { Account, Alert, BillingProvider, RejectReason, CreditGrant, DailyUsage, Invoice, UsageEvent, UsageRequest } from "./types";
 
 let _client: Metronome | null = null;
@@ -264,13 +264,17 @@ export const metronomeBilling: BillingProvider = {
       throw new Error("To cancel a scheduled downgrade, please contact support.");
     }
     const c = ctx();
-    const r = await H.changePlan(c, link.metronomeCustomerId, plan);
+    // Upgrades start at the next full hour (setup option "next_hour") so usage already ingested this hour isn't re-rated
+    // with the new plan. METRONOME_UPGRADE_START=floor restores "starts at the current hour".
+    const r = await H.changePlan(c, link.metronomeCustomerId, plan, { upgradeStart: process.env.METRONOME_UPGRADE_START === "floor" ? "floor" : "next_hour" });
     if (r.kind === "upgrade" && r.newContractId) {
       saveLink({ ...link, plan, metronomeContractId: r.newContractId, pendingPlan: undefined, accessCut: false });
       addPlanEvent(appUserId, { ts: new Date().toISOString(), kind: "upgrade", from: link.plan, to: plan, actor, contractId: r.newContractId });
       // Archiva la alerta del 20 % del plan anterior y crea la del nuevo (evaluate_on_create).
       await H.syncPlanLowBalanceAlert(c, link.metronomeCustomerId, plan).catch(e => console.error("[metronome] alerta 20 %:", e));
-      localAlert(link.metronomeCustomerId, "info", `Plan changed to ${planDisplayName(c.ids, plan)}. Your previous balance carries over.`, `plan_${r.newContractId}`);
+      const at = new Date(r.effectiveAt);
+      const when = at > new Date() ? ` ${planDisplayName(c.ids, plan)} credits and pricing apply from ${at.toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit", timeZone: "UTC" })} UTC.` : "";
+      localAlert(link.metronomeCustomerId, "info", `Plan changed to ${planDisplayName(c.ids, plan)}. Your previous balance carries over.${when}`, `plan_${r.newContractId}`);
     } else if (r.kind === "downgrade" && r.newContractId) {
       saveLink({ ...link, pendingPlan: { plan, effectiveAt: r.effectiveAt, contractId: r.newContractId } });
       addPlanEvent(appUserId, { ts: new Date().toISOString(), kind: "downgrade_scheduled", from: link.plan, to: plan, actor, effectiveAt: r.effectiveAt, contractId: r.newContractId });
@@ -403,6 +407,14 @@ export const metronomeBilling: BillingProvider = {
     saveLink({ ...link, accessCut: false });
     localAlert(link.metronomeCustomerId, "support", `Our support team added ${eur(g.amountEur)} of goodwill credit. Reason: ${g.reason}`, `gw_${g.grantId}`);
     return toAccount(getLink(appUserId)!);
+  },
+  async archiveDemoCustomer(appUserId) {
+    const link = mustLink(appUserId);
+    if (!isArchivableDemoCustomer(link.name)) throw new Error(`Only demo customers named "Nebula demo …" can be archived (this one is "${link.name}").`);
+    const name = await H.archiveDemoCustomer(ctx(), link.metronomeCustomerId); // re-checks the name stored in Metronome
+    tx(db => { delete db.links[appUserId]; });
+    cache.delete(appUserId);
+    return { archived: name };
   },
   async unblock(appUserId) {
     const link = mustLink(appUserId);

@@ -4,8 +4,9 @@ import { useRouter, useSearchParams } from "next/navigation";
 import { PLANS, eur, type PlanId } from "@/lib/catalog";
 import { api, useConfig } from "@/components/useAccount";
 import ModeBadge from "@/components/ModeBadge";
+import { DEMO_LIMIT_MESSAGE } from "@/lib/billing/types";
 
-const ERRORS: Record<string, string> = { stripe: "We couldn't save the card in Stripe. Please try again.", datos: "Sign-up details are missing. Please start again." };
+const ERRORS: Record<string, string> = { stripe: "We couldn't save the card in Stripe. Please try again.", datos: "Sign-up details are missing. Please start again.", demo_limit: DEMO_LIMIT_MESSAGE, signup: "We couldn't create your billing account. Please try again in a moment." };
 
 function SignupForm() {
   const sp = useSearchParams();

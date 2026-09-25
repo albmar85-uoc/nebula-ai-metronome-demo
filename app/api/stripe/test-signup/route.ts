@@ -4,6 +4,7 @@ import { PLANS, type PlanId } from "@/lib/catalog";
 import { COOKIE, COOKIE_OPTS } from "@/lib/session";
 import { stripe } from "@/lib/stripe";
 import { getLink } from "@/lib/store";
+import { DemoLimitError } from "@/lib/billing/types";
 
 // Live verification helper: sign-up without the hosted Checkout page, using Stripe TEST payment methods
 // (pm_card_visa, pm_card_authenticationRequired, …). Same result as /api/stripe/return: Stripe customer with a
@@ -36,6 +37,7 @@ export async function POST(req: Request) {
     res.cookies.set(COOKIE, a.customerId, COOKIE_OPTS);
     return res;
   } catch (e) {
+    if (e instanceof DemoLimitError) return NextResponse.json({ error: e.message, code: e.code }, { status: 409 });
     return NextResponse.json({ error: (e as Error).message }, { status: 400 });
   }
 }

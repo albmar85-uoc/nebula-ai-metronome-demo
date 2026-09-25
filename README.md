@@ -255,11 +255,23 @@ without the hosted Checkout page, names forced to "Nebula demo …". The mock de
 - A successful bundle is confirmed by polling `findBundleCommit`, both right after the purchase and on reads, because payment webhooks can't arrive yet.
 
 **Not verified: blocked or needs setup**
+- **Charges with matching keys (web flow on :3001, fresh Pro sign-up with `pm_card_visa`, 2026-09-25 22:25 Madrid):**
+  - **€50 bundle: passes.** Stripe PaymentIntent succeeded, the commit was released and the €5 gift was granted by polling `findBundleCommit` (€30 → €85). The Metronome invoice shows paid.
+  - **Pro plan fee (€29):** Metronome creates the Stripe invoice. Alberto disabled "Leave invoices as drafts" in Metronome's Stripe integration, so it is now **open with automatic collection** and Stripe charges it on its first automatic attempt, about 1 hour after creation. Before that change, the invoices stayed in draft because of that integration setting, not an app bug.
+  - **Auto-recharge: passes.** After a drain to €6.02 (threshold €10), Metronome charged €44.34 (Stripe PaymentIntent succeeded) and added an "Auto-recharge" commit, bringing the balance back to €50. The top-up fired on the **next usage event** after the crossing, not on the request that crossed. With no further traffic it would wait. The expert also saw a €40.11 top-up.
 - **Customer-create 404, root cause (resolved):** the Metronome account is a **Trial limited to 5 active customers**. With a Stripe billing config in the body, Metronome hides that limit behind `404 "The specified customer was not found"`. Without a billing config the same call returns the real message: "Trial accounts are limited to 5 active customers". The 5th active customer was created at 21:44:48 (Madrid), and every create after that failed, whatever Stripe customer or account was used. Keys, request body (matches the docs example exactly) and Stripe account were all correct. Archiving 3 unused "Nebula demo" customers freed slots, and the create then worked with a Stripe customer in acct_1T56leGe. Keep ≤ 5 active customers (archive test ones) or upgrade the Metronome plan. The adapter now adds this hint to the error.
 - **Charges before the key switch** (keys on acct_1T56lXGb, Metronome on acct_1T56leGe): fee invoices ended `INVALID_REQUEST_ERROR "No such customer"`, and the bundle gate failed with "could not read the default payment method… No such customer". With matching keys, the Pro fee invoice is handed to Stripe (Stripe invoice created in acct_1T56leGe). Bundle and auto-recharge charges are pending the expert's setup rerun.
 - **Webhooks from Metronome**: they need a public URL (a tunnel such as cloudflared or ngrok, or a deployment) and the secret from the dashboard (`METRONOME_WEBHOOK_SECRET`). Until then the app polls.
 - **Integration rule** `stripe_product_id → invoiceitem.price` (Metronome dashboard, pending): Stripe invoice items won't be tied to Stripe products/prices until it's set.
 - Fee proration on upgrade: the test customers were upgraded in the same hour as sign-up, so the prorated fee equals the full fee. Check with a customer that is at least a day into its period.
+
+**Plan-change timing and Free overage (from the expert's helpers)**
+- Upgrades start at the **next full hour** (`upgradeStart: "next_hour"`). Usage already ingested this hour stays rated on the old plan (with "floor", Metronome re-rated it with the new plan). The app switches the plan right away, and the customer is told when the new credits and pricing apply (up to 59 min). `METRONOME_UPGRADE_START=floor` restores the previous behaviour. Downgrades still start next period.
+- The **Free** contract (sign-up and downgrade to Free) carries the setup's "guarantee zero overages" overrides (`buildZeroOverageOverrides`): MULTIPLIER 0 on usage plus commit-specific OVERWRITE at list price, so with no balance the usage line is €0. The app-side worst-case guard stays as a second layer. Parity with the setup's dry run: 18/18.
+
+**Demo limit (Metronome Trial = 5 active customers)**
+- At the limit, sign-up shows "Demo limit reached: this sandbox allows 5 active customers. Archive unused demo customers in Admin and try again." (API: 409 `demo_limit`).
+- Admin → customer → **Archive demo customer** (`POST /api/admin/customers/:id/archive`): only for names starting with "Nebula demo". In live mode the name stored in Metronome is re-checked before `POST /v1/customers/archive`; mock mode just deletes the account.
 
 ## Open TODOs
 

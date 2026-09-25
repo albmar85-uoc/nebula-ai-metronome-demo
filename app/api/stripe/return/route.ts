@@ -1,3 +1,4 @@
+import { DemoLimitError } from "@/lib/billing/types";
 import { NextResponse } from "next/server";
 import type Stripe from "stripe";
 import { billing, isStripeLive } from "@/lib/billing";
@@ -24,7 +25,13 @@ export async function GET(req: Request) {
   if (!name || !email || !plan || !(plan in PLANS)) return NextResponse.redirect(new URL("/signup?error=datos", url));
   // Idempotente: el id de usuario se deriva del cliente de Stripe (appUserIdFor) y el alta busca por ingest alias;
   // si el usuario recarga esta URL, se reutiliza el cliente/contrato ya creados.
-  const a = await billing.signup({ name, email, plan: plan as PlanId, stripeCustomerId: customerId });
+  let a;
+  try {
+    a = await billing.signup({ name, email, plan: plan as PlanId, stripeCustomerId: customerId });
+  } catch (e) {
+    console.error("[signup]", (e as Error).message);
+    return NextResponse.redirect(new URL(`/signup?error=${e instanceof DemoLimitError ? "demo_limit" : "signup"}`, url));
+  }
   const res = NextResponse.redirect(new URL("/dashboard", url));
   res.cookies.set(COOKIE, a.customerId, COOKIE_OPTS);
   return res;

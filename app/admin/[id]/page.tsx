@@ -7,6 +7,7 @@ import { METRICS, PLANS, eur, type PlanId } from "@/lib/catalog";
 import type { AccountView } from "@/components/useAccount";
 import type { AdminLogEntry, PlanEvent, Purchase } from "@/lib/store";
 import type { PublicApiKey } from "@/lib/apikeys";
+import { isArchivableDemoCustomer } from "@/lib/billing/types";
 
 type Detail = { account: AccountView; planHistory: PlanEvent[]; adminLog: AdminLogEntry[]; apiKeys: PublicApiKey[]; purchases: Purchase[]; link?: { metronomeCustomerId: string; metronomeContractId: string; stripeCustomerId?: string } };
 const dt = (iso: string) => new Date(iso).toLocaleString("en-US", { dateStyle: "short", timeStyle: "short" });
@@ -40,6 +41,16 @@ function CustomerDetail({ logout }: { logout: () => void }) {
       if (!r.ok) throw new Error(j.error);
       setOk(done); await load(); return true;
     } catch (e) { setErr((e as Error).message); return false; } finally { setBusy(""); }
+  }
+  async function archive() {
+    if (!window.confirm(`Archive "${data?.account.name}"? This frees a demo slot and removes the customer from this app.`)) return;
+    setBusy("archive"); setErr(""); setOk("");
+    try {
+      const r = await fetch(`/api/admin/customers/${encodeURIComponent(id)}/archive`, { method: "POST" });
+      const j = await r.json();
+      if (!r.ok) throw new Error(j.error);
+      window.location.href = "/admin";
+    } catch (e) { setErr((e as Error).message); setBusy(""); }
   }
   if (!data) return <main className="wrap">{err ? <div className="banner bad" role="alert">{err}</div> : <p className="muted">Loading…</p>}</main>;
   const a = data.account;
@@ -79,6 +90,13 @@ function CustomerDetail({ logout }: { logout: () => void }) {
             <p className="muted" style={{ fontSize: 13 }}>Lifts the access block (zero-balance webhook or failed payment). If there is no balance, also grant a credit.</p>
             <button className="btn" style={{ width: "100%" }} disabled={!!busy || (!a.blocked && !a.accessCut)} onClick={() => act("unblock", "unblock", {}, "Access re-enabled.")}>{busy === "unblock" ? "Unblocking…" : "Unblock access"}</button>
           </div>
+          {isArchivableDemoCustomer(a.name) && (
+            <div>
+              <h4 style={{ margin: "0 0 4px" }}>Archive demo customer</h4>
+              <p className="muted" style={{ fontSize: 13 }}>Frees a slot: the Metronome sandbox allows 5 active customers. Only for customers named &ldquo;Nebula demo …&rdquo;.</p>
+              <button className="btn" style={{ width: "100%" }} disabled={!!busy} onClick={archive}>{busy === "archive" ? "Archiving…" : "Archive customer"}</button>
+            </div>
+          )}
           <form onSubmit={e => { e.preventDefault(); act("plan", "plan", { plan }, `Plan updated (${PLANS[plan].name}).`); }}>
             <h4 style={{ margin: "0 0 4px" }}>Change plan</h4>
             <label className="f" htmlFor="adm-plan">New plan</label>

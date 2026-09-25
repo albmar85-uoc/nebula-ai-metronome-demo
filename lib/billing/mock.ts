@@ -7,11 +7,12 @@
 //  - recarga automática "hasta 50 €" (Free/Pro/Scale), cobro anticipado por umbral de gasto (Scale), promos con caducidad;
 //  - alertas del 20 % (por plan) y de 0 €, corte de acceso en Free/Pro; ingesta idempotente por id de petición.
 import { AUTO_RECHARGE, BUNDLES, LOW_BALANCE_RATIO, METRICS, PLANS, PROMOTIONS, SPEND_THRESHOLD, eur, type BundleId, type MetricId, type PlanId } from "../catalog";
-import { addPlanEvent, addPurchase, getAccount, getAlerts, getPurchase, pendingPurchases, resolvePurchase, saveAccount } from "../store";
+import { addPlanEvent, addPurchase, getAccount, getAlerts, getPurchase, pendingPurchases, resolvePurchase, saveAccount, tx } from "../store";
 import { coversWorstCase, capAlerts, capMessage, fitsCap, normalizeCap, periodSpend, requestCost } from "./limits";
 import { recommendPlan, round2, usageLast30DaysFromDaily } from "./insights";
 import type { InvoiceLineView, UpcomingInvoicePreview } from "./metronome-types";
 import type { Account, Alert, BillingProvider, RejectReason, CreditGrant, DailyUsage, Invoice, InvoiceLine, UsageRequest } from "./types";
+import { isArchivableDemoCustomer } from "./types";
 
 const id = (p: string) => `${p}_${Math.random().toString(36).slice(2, 10)}`;
 import { nowDate, nowIso, nowMs } from "../clock";
@@ -509,6 +510,12 @@ export const mockBilling: BillingProvider = {
     pushAlert(a, "support", `Our support team added ${eur(g.amountEur)} of goodwill credit (valid until ${fmtDay(expiresAt)}). Reason: ${g.reason}`);
     saveAccount(a);
     return withWebhookAlerts(a);
+  },
+  async archiveDemoCustomer(customerId) {
+    const a = load(customerId);
+    if (!isArchivableDemoCustomer(a.name)) throw new Error(`Only demo customers named "Nebula demo …" can be archived (this one is "${a.name}").`);
+    tx(db => { delete db.accounts[customerId]; });
+    return { archived: a.name };
   },
   async unblock(customerId) {
     const a = load(customerId);

@@ -12,6 +12,7 @@ import type {
   UpcomingInvoicePreview, UsageLast30Days, WebhookAction, BundlePurchaseResult, MetricUsage,
 } from "./metronome-types";
 import { METRICS } from "../catalog";
+import { DEMO_CUSTOMER_PREFIX, DemoLimitError, isArchivableDemoCustomer } from "./types";
 
 /** Contexto que reciben todos los helpers (en el setup: { client: MetronomeClient; ids }). */
 export type Ctx = { client: Metronome; ids: MetronomeIds };
@@ -54,9 +55,11 @@ export async function createCustomerWithStripe(ctx: Ctx, input: CreateCustomerIn
     res = await ctx.client.v1.customers.create(buildCreateCustomerBody(input));
   } catch (e) {
     // Seen live: with a Stripe billing config, Metronome masks the Trial limit ("Trial accounts are limited to 5 active
-    // customers") as 404 "The specified customer was not found". Make the log actionable.
-    if (/specified customer was not found/i.test((e as Error).message)) {
-      throw new Error(`${(e as Error).message}. Metronome also returns this when the account's active-customer limit is reached (Trial: 5 active customers; archive unused ones) or when the Stripe customer isn't in the connected Stripe account/mode.`);
+    // customers") as 404 "The specified customer was not found". Both map to a clear demo-limit message.
+    const msg = (e as Error).message;
+    if (/Trial accounts are limited|specified customer was not found/i.test(msg)) {
+      console.error("[metronome] customer create rejected (Trial limit of 5 active customers, or Stripe customer not in the connected account):", msg);
+      throw new DemoLimitError(msg);
     }
     throw e;
   }
@@ -101,6 +104,35 @@ export function buildSpendThresholdConfig(ctx: Ctx, enabled = true, thresholdEur
     commit: { product_id: ctx.ids.products.fixed.spend_threshold, name: "Early usage charge", priority: PRIORITIES.spendThreshold },
     payment_gate_config: STRIPE_PAYMENT_INTENT_GATE,
   } satisfies Metronome.V1.ContractCreateParams["spend_threshold_configuration"];
+}
+
+/** Rate-card list price per product unit (tokens are priced per 1M in the rate card, images per image). */
+const RATE_CARD_UNIT_PRICE: Record<MetricId, number> = {
+  input_tokens: METRICS.input_tokens.pricePerUnit * 1_000_000,
+  output_tokens: METRICS.output_tokens.pricePerUnit * 1_000_000,
+  images: METRICS.images.pricePerUnit,
+};
+const round6 = (n: number) => Math.round(n * 1e6) / 1e6;
+
+/**
+ * "Guarantee zero overages" overrides (= buildZeroOverageOverrides of the setup), for the Free plan. The contract's usage
+ * list price is set to €0 with a MULTIPLIER 0 on the usage tag, and the real price is restored with commit-specific
+ * OVERWRITE overrides that only apply while usage draws down a commit/credit (plan credits, bundles, promos).
+ * With balance: charged at the real price against credits; without: the usage line is €0, never overage.
+ * https://docs.metronome.com/guides/pricing-packaging/apply-credits-and-commits/guarantee-zero-overages
+ */
+export function buildZeroOverageOverrides(ctx: Ctx, plan: PlanId, startingAt: string) {
+  const mult = round2(1 - PLANS[plan].discount);
+  return [
+    { starting_at: startingAt, type: "MULTIPLIER" as const, multiplier: 0, applicable_product_tags: [USAGE_TAG] },
+    ...(Object.keys(RATE_CARD_UNIT_PRICE) as MetricId[]).map(k => ({
+      starting_at: startingAt,
+      type: "OVERWRITE" as const,
+      is_commit_specific: true,
+      overwrite_rate: { rate_type: "FLAT" as const, price: round6(RATE_CARD_UNIT_PRICE[k] * mult), credit_type_id: ctx.ids.credit_types.EUR },
+      override_specifiers: [{ product_id: ctx.ids.products.usage[k] }],
+    })),
+  ];
 }
 
 /** Cuerpo exacto de POST /v1/contracts/create para un plan (= buildPlanContractBody del setup). */
@@ -149,7 +181,9 @@ export function buildPlanContractBody(ctx: Ctx, o: PlanContractOptions): Metrono
           ],
         }
       : {}),
-    ...(multiplier < 1 ? { overrides: [{ starting_at: startingAt, type: "MULTIPLIER" as const, multiplier, applicable_product_tags: [USAGE_TAG] }] } : {}),
+    ...(plan.zeroOverageGuarantee
+      ? { overrides: buildZeroOverageOverrides(ctx, o.plan, startingAt) }
+      : multiplier < 1 ? { overrides: [{ starting_at: startingAt, type: "MULTIPLIER" as const, multiplier, applicable_product_tags: [USAGE_TAG] }] } : {}),
     ...(o.autoRecharge ? { prepaid_balance_threshold_configuration: buildPrepaidBalanceThresholdConfig(ctx) } : {}),
     ...(o.spendThreshold ? { spend_threshold_configuration: buildSpendThresholdConfig(ctx) } : {}),
     ...(o.fromContractId ? { transition: { type: "RENEWAL" as const, from_contract_id: o.fromContractId } } : {}),
@@ -209,7 +243,24 @@ export function nextPeriodStart(anchorIso: string, now = new Date()): string {
 }
 
 /** Subida: transición RENEWAL inmediata (prorrateo). Bajada: transición al inicio del siguiente periodo. */
-export async function changePlan(ctx: Ctx, customerId: string, newPlan: PlanId, opts: { now?: Date } = {}): Promise<PlanChangeResult> {
+/**
+ * upgradeStart (= setup): "floor" starts the new plan at the current full hour, so usage already ingested in that hour is
+ * re-rated with the new plan (seen live by the expert). "next_hour" starts at the next full hour: nothing from the old
+ * plan is re-rated, but the change takes up to 59 min to apply in Metronome. Downgrades always start next period.
+ */
+export function upgradeStartAt(mode: "floor" | "next_hour", now = new Date()) {
+  const floor = floorToHour(now);
+  return mode === "next_hour" ? new Date(new Date(floor).getTime() + 3600_000).toISOString() : floor;
+}
+/** Archive a Metronome customer, only if its Metronome name starts with "Nebula demo" (never touches other customers). */
+export async function archiveDemoCustomer(ctx: Ctx, customerId: string) {
+  const c = (await ctx.client.v1.customers.retrieve({ customer_id: customerId })).data;
+  if (!isArchivableDemoCustomer(c.name)) throw new Error(`Refusing to archive "${c.name}": only customers named "${DEMO_CUSTOMER_PREFIX} …" can be archived here.`);
+  await ctx.client.v1.customers.archive({ id: customerId });
+  return c.name;
+}
+
+export async function changePlan(ctx: Ctx, customerId: string, newPlan: PlanId, opts: { now?: Date; upgradeStart?: "floor" | "next_hour" } = {}): Promise<PlanChangeResult> {
   const current = await getActiveContract(ctx, customerId);
   if (!current) throw new Error(`Customer ${customerId} has no active contract`);
   const summary = summarizeContract(current);
@@ -217,7 +268,7 @@ export async function changePlan(ctx: Ctx, customerId: string, newPlan: PlanId, 
   if (currentPlan === newPlan) return { kind: "same", fromContractId: current.id, effectiveAt: new Date().toISOString() };
   const isUpgrade = !currentPlan || PLANS[newPlan].rank > PLANS[currentPlan].rank;
   const anchor = summary.billingAnchorDate ?? current.starting_at;
-  const startingAt = isUpgrade ? floorToHour(opts.now) : nextPeriodStart(anchor, opts.now);
+  const startingAt = isUpgrade ? upgradeStartAt(opts.upgradeStart ?? "floor", opts.now) : nextPeriodStart(anchor, opts.now);
   const keepAutoRecharge = !!summary.autoRecharge?.enabled && PLANS[newPlan].autoRechargeAllowed;
   const newContractId = await createPlanContract(ctx, {
     customerId, plan: newPlan, startingAt, billingAnchorDate: anchor, fromContractId: current.id, autoRecharge: keepAutoRecharge,
