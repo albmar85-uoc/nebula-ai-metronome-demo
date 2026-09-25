@@ -3,6 +3,6 @@ import Stripe from "stripe";
 
 let _stripe: Stripe | null = null;
 export const stripe = () => {
-  if (!process.env.STRIPE_SECRET_KEY) throw new Error("Falta STRIPE_SECRET_KEY");
+  if (!process.env.STRIPE_SECRET_KEY) throw new Error("STRIPE_SECRET_KEY is not set");
   return (_stripe ??= new Stripe(process.env.STRIPE_SECRET_KEY));
 };

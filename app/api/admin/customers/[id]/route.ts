@@ -11,7 +11,7 @@ export async function GET(_: Request, { params }: { params: { id: string } }) {
     if (!a) throw new Error("Customer not found");
     const key = a.mode === "mock" ? a.customerId : read(db => db.links[a.customerId]?.metronomeCustomerId ?? a.customerId);
     return {
-      account: view(a),
+      account: view(a, true),
       planHistory: getPlanHistory(a.customerId),
       adminLog: getAdminLog(a.customerId).slice(0, 50),
       apiKeys: listApiKeys(a.customerId).map(toPublic),

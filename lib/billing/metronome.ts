@@ -3,14 +3,15 @@
 // aquí solo se orquesta: enlace usuario ↔ IDs externos (store), idempotencia con ids de la app y mapeo a la UI.
 import Metronome from "@metronome/sdk";
 import { createHash } from "node:crypto";
-import { METRICS, PLANS, eur, type MetricId, type PlanId } from "../catalog";
+import { BUNDLES, METRICS, PLANS, eur, type MetricId, type PlanId } from "../catalog";
 import { addAlert, addPlanEvent, addPurchase, claimRequestIds, getAlerts, getLink, getPurchase, pendingPurchases, read, resolvePurchase, saveLink, tx, findLinkByMetronomeId, type CustomerLink } from "../store";
 import { recommendPlan, usageLast30DaysFromDaily } from "./insights";
 import { capAlerts, capMessage, fitsCap, normalizeCap, periodSpend, requestCost } from "./limits";
 import { loadMetronomeIds, planDisplayName, promotionFromIds } from "./metronome-config";
 import * as H from "./metronome-helpers";
 import type { CreditGrantView, InvoiceView } from "./metronome-types";
-import { round, usageCost } from "./mock";
+import { lowBalanceLimit, round, usageCost } from "./mock";
+import { PaymentFailedError, paymentFailedMessage } from "./types";
 import type { Account, Alert, BillingProvider, RejectReason, CreditGrant, DailyUsage, Invoice, UsageEvent, UsageRequest } from "./types";
 
 let _client: Metronome | null = null;
@@ -31,14 +32,18 @@ export function mapGrant(g: CreditGrantView): CreditGrant {
 }
 
 export function mapInvoice(i: InvoiceView): Invoice {
-  const status: Invoice["status"] = i.status === "DRAFT" ? "draft" : i.status === "VOID" ? "void" : i.stripeStatus && !/paid/i.test(i.stripeStatus) ? "pending" : "paid";
+  // Verified live: a failed Stripe hand-off shows as external_status "INVALID_REQUEST_ERROR" + billing_provider_error.
+  const failed = !!i.stripeError || /ERROR|FAILED|UNCOLLECTIBLE/i.test(i.stripeStatus ?? "");
+  const status: Invoice["status"] = i.status === "DRAFT" ? "draft" : i.status === "VOID" ? "void" : failed ? "failed"
+    : i.stripeStatus ? (/paid/i.test(i.stripeStatus) ? "paid" : "pending")
+    : i.totalEur > 0 ? "pending" : "paid"; // finalized but not yet handed to Stripe (takes a few seconds live)
   const kindOf = (t: string) => (t === "usage" ? "usage" : t === "subscription" ? "fee" : t === "applied_commit_or_credit" ? "credit" : t === "commit_purchase" ? "commit" : undefined);
   return {
     id: i.id, date: i.issuedAt ?? i.periodEnd ?? i.periodStart ?? "", amount: i.totalEur, status,
-    description: i.type === "USAGE" ? (status === "draft" ? "Usage this period (draft)" : "Usage invoice") : i.type === "SCHEDULED" ? "Scheduled charge (commit/bundle)" : i.type,
+    description: i.type === "USAGE" ? (status === "draft" ? "Usage this period (draft)" : "Usage invoice") : i.type === "SCHEDULED" ? (i.lines.length === 1 ? i.lines[0].name : "Scheduled charge (plan fee or bundle)") : i.type,
     type: i.type === "USAGE" ? "usage" : "commit", periodStart: i.periodStart, periodEnd: i.periodEnd,
     lines: i.lines.map(l => ({ description: l.name, quantity: l.quantity, unitPrice: l.unitPriceEur, amount: l.totalEur, kind: kindOf(l.type) })),
-    externalId: i.stripeInvoiceId, pdfUrl: i.pdfUrl,
+    externalId: i.stripeInvoiceId, pdfUrl: i.pdfUrl, ...(failed ? { paymentError: i.stripeError ?? i.stripeStatus } : {}),
   };
 }
 
@@ -76,8 +81,46 @@ function mustLink(appUserId: string): CustomerLink {
 }
 
 function localAlert(key: string, type: Alert["type"], message: string, idSuffix: string) {
-  addAlert(key, { id: `loc_${idSuffix}`, ts: new Date().toISOString(), type, message, source: "local" });
+  const id = `loc_${idSuffix}`;
+  if (getAlerts(key).some(a => a.id === id)) return; // idempotent per id
+  addAlert(key, { id, ts: new Date().toISOString(), type, message, source: "local" });
 }
+
+/** Start of the current billing period: the contract's (anniversary) period when known, else the UTC calendar month. */
+function periodStartOf(link: CustomerLink) {
+  if (link.periodStart) return link.periodStart;
+  const now = new Date();
+  return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1)).toISOString();
+}
+
+/**
+ * Alerts from polled balances. Webhooks can't reach the app yet (no public URL / secret), so every Metronome read
+ * compares the balance with the previous one and raises the same notices the webhooks would: low balance (20% of
+ * plan credits) and €0 (Free/Pro: access paused until balance returns). One of each per billing period.
+ */
+function pollAlerts(link: CustomerLink, bal: number, periodStart: string) {
+  const prev = link.polledBalance;
+  const kinds = polledAlertKinds(prev, bal, lowBalanceLimit({ plan: link.plan }));
+  if (kinds.length) {
+    const key = `${link.metronomeContractId}_${periodStart.slice(0, 13)}`;
+    if (kinds.includes("low")) localAlert(link.metronomeCustomerId, "low_balance", `You have less than 20% of your plan credits left (${eur(bal)}). Want to top up?`, `poll_low_${key}`);
+    if (kinds.includes("zero")) localAlert(link.metronomeCustomerId, "zero_balance", PLANS[link.plan].overage ? "Balance used up. Overage will be billed at month end." : "Balance used up. API access is paused until you top up or upgrade.", `poll_zero_${key}`);
+  }
+  return prev !== bal || link.periodStart !== periodStart;
+}
+
+/** Which thresholds the balance crossed downwards between two polls (pure; unit tested). */
+export function polledAlertKinds(prev: number | undefined, bal: number, lowLimit: number): ("low" | "zero")[] {
+  if (prev === undefined || prev === bal) return [];
+  const out: ("low" | "zero")[] = [];
+  if (prev >= lowLimit && bal < lowLimit && bal > 0) out.push("low");
+  if (prev > 0 && bal <= 0) out.push("zero");
+  return out;
+}
+
+// Short cache for reads (/api/me polling): Metronome is read at most every CACHE_MS per customer; every write refreshes it.
+const CACHE_MS = 10_000;
+const cache = new Map<string, { at: number; account: Account }>();
 
 /** Aplica una bajada programada cuando llega su fecha y re-sincroniza la alerta del 20 % del nuevo plan. */
 async function resolvePending(link: CustomerLink): Promise<CustomerLink> {
@@ -93,6 +136,8 @@ async function toAccount(link0: CustomerLink): Promise<Account> {
   const link = await resolvePending(link0);
   const c = ctx();
   const cid = link.metronomeCustomerId;
+  // Polling instead of payment_gate webhooks: a pending bundle whose commit now exists gets its bonus (idempotent).
+  if (pendingPurchases(cid).length) await confirmBundlePaymentsLive(cid, true).catch(e => console.error("[metronome] bundle confirm:", e));
   const [balances, invoices, contract, upcoming, usage30] = await Promise.all([
     H.getBalanceSummary(c, cid),
     H.listInvoices(c, cid),
@@ -112,7 +157,11 @@ async function toAccount(link0: CustomerLink): Promise<Account> {
   const u30 = usage30 ?? usageLast30DaysFromDaily(cid, daily);
   const usageDue = upcoming ? upcoming.lines.filter(l => l.type !== "subscription").reduce((s, l) => s + l.totalEur, 0) : 0;
   const now = new Date();
-  return {
+  const periodStart = upcoming?.periodStart ?? periodStartOf(link);
+  const mapped = invoices.map(mapInvoice);
+  for (const i of mapped) if (i.status === "failed") localAlert(cid, "info", `Payment failed for "${i.description}" (${eur(i.amount)}). Please check your payment method.`, `invfail_${i.id}`);
+  if (pollAlerts(link, bal, periodStart)) saveLink({ ...getLink(link.appUserId)!, polledBalance: bal, periodStart });
+  const account: Account = {
     customerId: link.appUserId, name: link.name, email: link.email, plan: link.plan,
     pendingPlan: link.pendingPlan ? { plan: link.pendingPlan.plan, effectiveAt: link.pendingPlan.effectiveAt } : undefined,
     cardSaved: !!link.stripeCustomerId,
@@ -123,13 +172,15 @@ async function toAccount(link0: CustomerLink): Promise<Account> {
     accessCut,
     overageAccrued: plan.overage ? Math.max(0, round(usageDue)) : 0,
     credits, usage: usage.slice(0, 500), daily,
-    invoices: invoices.map(mapInvoice),
+    invoices: mapped,
     alerts: getAlerts(cid),
-    periodStart: upcoming?.periodStart ?? new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1)).toISOString(),
+    periodStart,
     periodEnd: upcoming?.periodEnd ?? H.nextPeriodStart(summary.billingAnchorDate ?? contract.starting_at),
     mode: "metronome",
     upcoming, usage30: u30, recommendation: recommendPlan(u30, link.plan),
   };
+  cache.set(link.appUserId, { at: Date.now(), account });
+  return account;
 }
 
 // ─────────────────────────── acciones disparadas por webhooks ───────────────────────────
@@ -185,6 +236,7 @@ export const metronomeBilling: BillingProvider = {
       appUserId, name: input.name, email: input.email, plan: input.plan,
       metronomeCustomerId: customer.metronomeCustomerId, metronomeContractId: contractId, stripeCustomerId: input.stripeCustomerId,
       createdAt: new Date().toISOString(),
+      polledBalance: PLANS[input.plan].monthlyCredits, // baseline for polled low/zero alerts
     };
     saveLink(link);
     addPlanEvent(appUserId, { ts: link.createdAt, kind: "signup", to: input.plan, actor: "customer", contractId });
@@ -194,7 +246,10 @@ export const metronomeBilling: BillingProvider = {
   },
   async get(appUserId) {
     const link = getLink(appUserId);
-    return link ? toAccount(link) : null;
+    if (!link) return null;
+    const hit = cache.get(appUserId);
+    if (hit && Date.now() - hit.at < CACHE_MS) return { ...hit.account, alerts: getAlerts(link.metronomeCustomerId) };
+    return toAccount(link);
   },
   async getInvoice(appUserId, invoiceId) {
     const link = mustLink(appUserId);
@@ -204,7 +259,7 @@ export const metronomeBilling: BillingProvider = {
     const link = await resolvePending(mustLink(appUserId));
     if (!PLANS[plan]) throw new Error("Unknown plan");
     if (link.plan === plan && link.pendingPlan) {
-      // TODO(verificar): cancelar una bajada programada = archivar el contrato futuro (POST /v1/contracts/archive) y
+      // Open design point (not in the setup helpers, not exercised live): cancelar una bajada programada = archivar el contrato futuro (POST /v1/contracts/archive) y
       // quitar el ending_before del actual. No está en los helpers del setup; pendiente de confirmar con Metronome.
       throw new Error("To cancel a scheduled downgrade, please contact support.");
     }
@@ -229,8 +284,19 @@ export const metronomeBilling: BillingProvider = {
       addPurchase({ purchaseId, customerKey: link.metronomeCustomerId, contractId: link.metronomeContractId, bundle, status: "payment_pending", createdAt: new Date().toISOString() });
     }
     // Commit con payment gate: Metronome cobra en Stripe al momento; el bonus llega con el webhook de pago.
-    await H.buyBundle(ctx(), { customerId: link.metronomeCustomerId, contractId: link.metronomeContractId, bundle, purchaseId });
-    return toAccount(link);
+    try {
+      await H.buyBundle(ctx(), { customerId: link.metronomeCustomerId, contractId: link.metronomeContractId, bundle, purchaseId });
+    } catch (e) {
+      // Payment gate failed (card declined, billing provider not reachable…): no commit is created, so nothing to undo.
+      console.error("[metronome] bundle payment gate failed:", (e as Error).message);
+      resolvePurchase(purchaseId, "failed");
+      const b = BUNDLES[bundle];
+      localAlert(link.metronomeCustomerId, "info", `${paymentFailedMessage(`the ${eur(b.price)} bundle`)}`, `payfail_${purchaseId}`);
+      throw new PaymentFailedError(paymentFailedMessage(`the ${eur(b.price)} bundle`), (e as Error).message);
+    }
+    // No webhooks yet (no public URL): confirm right away by polling the commit; the webhook path stays for later.
+    await confirmBundlePaymentsLive(link.metronomeCustomerId, true).catch(e => console.error("[metronome] bundle confirm:", e));
+    return toAccount(getLink(appUserId)!);
   },
   async setAutoRecharge(appUserId, enabled) {
     const link = mustLink(appUserId);
@@ -264,12 +330,11 @@ export const metronomeBilling: BillingProvider = {
     }
     const valid = requests.filter(r => r.requestId);
     // Límite de gasto del cliente (regla de la app): con la copia local del uso del periodo, a precio de plan.
-    // TODO(verificar): el periodo local es el mes natural UTC; en vivo debería usarse el periodo del contrato (upcoming.periodStart).
+    // Verified live: contract periods are anniversary-based (signup hour), so the cap uses the contract period start.
     let capHit = false;
     const inCap: UsageRequest[] = [];
     if (link.spendCap) {
-      const now = new Date();
-      const periodStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1)).toISOString();
+      const periodStart = periodStartOf(link);
       let spent = periodSpend(dailyFrom(read(db => db.usage[appUserId] ?? [])), periodStart);
       for (const r of valid) {
         const cost = requestCost(r, plan.discount);
@@ -289,8 +354,7 @@ export const metronomeBilling: BillingProvider = {
     });
     tx(db => { db.usage[appUserId] = [...local, ...(db.usage[appUserId] ?? [])].slice(0, 5000); });
     if (link.spendCap) {
-      const now = new Date();
-      const periodStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1)).toISOString();
+      const periodStart = periodStartOf(link);
       const spent = periodSpend(dailyFrom(read(db => db.usage[appUserId] ?? [])), periodStart);
       const cap = { ...link.spendCap };
       const kinds = capAlerts(cap, capHit ? cap.monthlyEur : spent, periodStart);
@@ -303,11 +367,10 @@ export const metronomeBilling: BillingProvider = {
   },
   async setSpendCap(appUserId, monthlyEur) {
     // Regla de la app (Metronome no rechaza peticiones). El aviso del 80 % lo emite la app al ingerir.
-    // TODO(verificar): alternativa en Metronome = alerta de cliente de tipo gasto/uso (p. ej. "usage_threshold_reached"
+    // Open design point (kept as an app rule): alternativa en Metronome = alerta de cliente de tipo gasto/uso (p. ej. "usage_threshold_reached"
     // sobre el total facturable) que llegue por webhook; no está en los helpers del setup.
     const link = mustLink(appUserId);
-    const now = new Date();
-    const periodStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1)).toISOString();
+    const periodStart = periodStartOf(link);
     const spent = periodSpend(dailyFrom(read(db => db.usage[appUserId] ?? [])), periodStart);
     const cap = normalizeCap(monthlyEur, spent, link.spendCap);
     saveLink({ ...link, spendCap: cap });
@@ -316,7 +379,7 @@ export const metronomeBilling: BillingProvider = {
   },
   async grantGoodwill(appUserId, g) {
     // Crédito de cortesía = crédito promocional con código único por concesión (uniqueness_key nebula-promo-<cliente>-GOODWILL-<id>).
-    // TODO(verificar): quizá convenga un producto propio "goodwill_credit" en el setup para separarlo en los informes.
+    // Open design point for the Metronome expert: quizá convenga un producto propio "goodwill_credit" en el setup para separarlo en los informes.
     const link = mustLink(appUserId);
     const code = `GOODWILL-${g.grantId}`.slice(0, 60);
     try {

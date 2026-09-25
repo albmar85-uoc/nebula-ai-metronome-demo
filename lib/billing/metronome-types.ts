@@ -136,6 +136,8 @@ export interface InvoiceView {
   /** external_invoice (Stripe) */
   stripeInvoiceId?: string;
   stripeStatus?: string;
+  /** external_invoice.billing_provider_error (e.g. "No such customer: 'cus_…'"). */
+  stripeError?: string;
   pdfUrl?: string;
 }
 

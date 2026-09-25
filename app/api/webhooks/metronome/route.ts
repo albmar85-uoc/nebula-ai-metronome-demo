@@ -13,7 +13,7 @@ export async function POST(req: Request) {
     if (!v.ok) return NextResponse.json({ error: v.reason }, { status: 401 });
     verified = true;
   } else if (isLive()) {
-    return NextResponse.json({ error: "Falta METRONOME_WEBHOOK_SECRET" }, { status: 503 });
+    return NextResponse.json({ error: "METRONOME_WEBHOOK_SECRET is not set" }, { status: 503 });
   }
   let ev: MetronomeEvent;
   try { ev = JSON.parse(raw); } catch { return NextResponse.json({ error: "Invalid JSON" }, { status: 400 }); }

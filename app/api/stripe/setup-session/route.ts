@@ -19,7 +19,7 @@ export async function POST(req: Request) {
     // Metronome necesita una dirección válida para cobrar commits con payment gate.
     billing_address_collection: "required",
     customer_update: { address: "auto", name: "auto" },
-    locale: "es",
+    locale: "auto",
     metadata: { name, email, plan },
     success_url: `${origin}/api/stripe/return?session_id={CHECKOUT_SESSION_ID}`,
     cancel_url: `${origin}/signup?plan=${plan}&cancelled=1`,

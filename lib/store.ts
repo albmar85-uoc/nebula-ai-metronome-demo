@@ -19,6 +19,10 @@ export type CustomerLink = {
   metronomeContractId: string;
   stripeCustomerId?: string;
   spendCap?: import("./billing/types").SpendCap; // límite de gasto del cliente (lo aplica la app)
+  /** Live: last balance read from Metronome (alerts derived from polling while webhooks can't reach the app). */
+  polledBalance?: number;
+  /** Live: start of the current contract billing period (anniversary-based, from the draft invoice). */
+  periodStart?: string;
   createdAt: string;
 };
 

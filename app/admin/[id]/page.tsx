@@ -112,7 +112,7 @@ function CustomerDetail({ logout }: { logout: () => void }) {
           <h3 id="inv-title">Invoices</h3>
           <div className="tablewrap" tabIndex={0}><table><caption className="sr-only">Invoices</caption>
             <thead><tr><th scope="col">Date</th><th scope="col">Description</th><th scope="col" style={{ textAlign: "right" }}>Amount</th></tr></thead>
-            <tbody>{a.invoices.slice(0, 12).map(i => <tr key={i.id}><td>{dt(i.date)}</td><td>{i.description}</td><td style={{ textAlign: "right", whiteSpace: "nowrap" }}>{eur(i.amount)} <span className="badge">{i.status}</span></td></tr>)}</tbody>
+            <tbody>{a.invoices.slice(0, 12).map(i => <tr key={i.id}><td>{dt(i.date)}</td><td>{i.description}</td><td style={{ textAlign: "right", whiteSpace: "nowrap" }}>{eur(i.amount)} <span className="badge">{i.status}</span>{i.paymentError && <div className="muted" style={{ fontSize: 12 }}>{i.paymentError}</div>}</td></tr>)}</tbody>
           </table></div>
         </section>
         <section className="card" aria-labelledby="al-title">

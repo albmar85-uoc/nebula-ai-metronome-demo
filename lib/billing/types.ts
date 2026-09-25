@@ -20,7 +20,9 @@ export type Invoice = {
   date: string;
   description: string;
   amount: number;
-  status: "paid" | "pending" | "draft" | "void";
+  status: "paid" | "pending" | "draft" | "void" | "failed";
+  /** Raw billing-provider error when the charge failed (admin only; customers see a generic message). */
+  paymentError?: string;
   type?: "subscription" | "commit" | "usage" | "proration" | "threshold";
   periodStart?: string;
   periodEnd?: string;
@@ -91,4 +93,15 @@ export interface BillingProvider {
   /** Soporte: levanta el corte de acceso (webhook de saldo 0 / pago fallido). No crea saldo. */
   unblock(customerId: string): Promise<Account>;
   getInvoice(customerId: string, invoiceId: string): Promise<Invoice | null>;
+}
+
+/** A charge could not be completed (Stripe declined, Metronome payment gate failed, billing provider misconfigured). */
+export class PaymentFailedError extends Error {
+  readonly code = "payment_failed";
+  constructor(message: string, readonly detail?: string) { super(message); this.name = "PaymentFailedError"; }
+}
+
+/** Customer-facing English message for a failed charge; the raw provider error goes to the server log only. */
+export function paymentFailedMessage(what: string) {
+  return `Payment failed: we couldn't charge your card for ${what}, so nothing was added to your balance and you haven't been charged. Please check your payment method or try again later.`;
 }

@@ -7,7 +7,7 @@ import type { Invoice } from "@/lib/billing/types";
 import type { AccountView } from "@/components/useAccount";
 
 const STATUS: Record<Invoice["status"], { label: string; cls: string }> = {
-  paid: { label: "Paid", cls: "ok" }, pending: { label: "Payment pending", cls: "warn" }, draft: { label: "Draft (closes at month end)", cls: "" }, void: { label: "Void", cls: "bad" },
+  paid: { label: "Paid", cls: "ok" }, pending: { label: "Payment pending", cls: "warn" }, draft: { label: "Draft (closes at month end)", cls: "" }, void: { label: "Void", cls: "bad" }, failed: { label: "Payment failed", cls: "bad" },
 };
 const TYPE: Record<NonNullable<Invoice["type"]>, string> = { subscription: "Subscription", commit: "Balance purchase", usage: "Usage", proration: "Plan change proration", threshold: "Early threshold charge" };
 const d = (s?: string, utc = false) => (s ? new Date(s).toLocaleDateString("en-US", { day: "numeric", month: "long", year: "numeric", ...(utc ? { timeZone: "UTC" } : {}) }) : "—");
@@ -34,6 +34,7 @@ function Detail({ id, a }: { id: string; a: AccountView }) {
           </div>
           <span className={`badge ${st.cls}`}>{st.label}</span>
         </div>
+        {inv.status === "failed" && <div className="banner bad" role="alert" style={{ marginTop: 16 }}>Payment failed: we couldn&apos;t charge your card for this invoice. Please check your payment method; our team has been notified.</div>}
         <div className="grid g3" style={{ margin: "20px 0" }}>
           <div><div className="label">Customer</div>{a.name}<div className="muted" style={{ fontSize: 13 }}>{a.email}</div></div>
           <div><div className="label">Date</div>{d(inv.date)}<div className="muted" style={{ fontSize: 13 }}>{inv.type ? TYPE[inv.type] : ""}</div></div>

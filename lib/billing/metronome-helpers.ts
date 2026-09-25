@@ -60,6 +60,9 @@ export type PlanContractOptions = {
   autoRecharge?: boolean; spendThreshold?: boolean; uniquenessKey?: string;
 };
 
+/** customerBalances/list (contracts.listBalances) rejects limit > 25 (undocumented; seen in the sandbox). The SDK iterator paginates. */
+export const BALANCES_PAGE_LIMIT = 25;
+
 export const STRIPE_PAYMENT_INTENT_GATE = { payment_gate_type: "STRIPE", tax_type: "NONE", stripe_config: { payment_type: "PAYMENT_INTENT" } } as const;
 
 export function buildPrepaidBalanceThresholdConfig(ctx: Ctx, enabled = true) {
@@ -74,7 +77,7 @@ export function buildPrepaidBalanceThresholdConfig(ctx: Ctx, enabled = true) {
       applicable_product_tags: [USAGE_TAG],
       // `duration` y `rollover_fraction` están en la spec oficial (PrepaidBalanceThresholdCommit, https://docs.metronome.com/openapi.json)
       // y en el setup, pero NO en las typings de @metronome/sdk 3.10.0 → se añaden fuera del tipo; el SDK envía el cuerpo tal cual.
-      // TODO(verificar): confirmar en sandbox que se aceptan (el validador del setup los da por buenos contra la spec).
+      // Verified live (sandbox, 2026-09-25): accepted and stored as duration {value:"12",unit:"MONTHS"}, rollover_fraction 1.
       ...({ duration: { value: AUTO_RECHARGE.validityMonths, unit: "MONTHS" }, rollover_fraction: 1 } as object),
     },
     payment_gate_config: STRIPE_PAYMENT_INTENT_GATE,
@@ -286,7 +289,7 @@ export async function grantBundleBonus(ctx: Ctx, p: { customerId: string; contra
 
 /** Busca el commit de una compra por custom field nebula_purchase_id (confirma que el pago liberó el commit). */
 export async function findBundleCommit(ctx: Ctx, customerId: string, purchaseId: string) {
-  for await (const x of ctx.client.v1.contracts.listBalances({ customer_id: customerId, include_contract_balances: true, include_balance: true, limit: 100 })) {
+  for await (const x of ctx.client.v1.contracts.listBalances({ customer_id: customerId, include_contract_balances: true, include_balance: true, limit: BALANCES_PAGE_LIMIT })) {
     const r = x as unknown as { id: string; type: string; custom_fields?: Record<string, string>; contract?: { id: string } };
     if (r.type === "PREPAID" && r.custom_fields?.nebula_purchase_id === purchaseId) return r;
   }
@@ -413,7 +416,7 @@ export function toGrantView(ctx: Ctx, r: RawBalance, now = new Date().toISOStrin
 export async function getBalanceSummary(ctx: Ctx, customerId: string): Promise<BalanceSummary> {
   const now = new Date().toISOString();
   const grants: CreditGrantView[] = [];
-  for await (const r of ctx.client.v1.contracts.listBalances({ customer_id: customerId, covering_date: now, include_contract_balances: true, include_balance: true, exclude_zero_balances: false, limit: 100 })) {
+  for await (const r of ctx.client.v1.contracts.listBalances({ customer_id: customerId, covering_date: now, include_contract_balances: true, include_balance: true, exclude_zero_balances: false, limit: BALANCES_PAGE_LIMIT })) {
     grants.push(toGrantView(ctx, r as unknown as RawBalance, now));
   }
   return { customerId, currency: "EUR", netBalanceEur: await getNetBalanceEur(ctx, customerId), grants, asOf: now };
@@ -423,7 +426,7 @@ type RawLine = { name: string; type: string; quantity?: number; unit_price?: num
 type RawInvoice = {
   id: string; status: string; type: string; contract_id?: string; issued_at?: string; start_timestamp?: string; end_timestamp?: string;
   total: number; credit_type: { id: string; name: string }; line_items: RawLine[];
-  external_invoice?: { invoice_id?: string; external_status?: string; pdf_url?: string } | null;
+  external_invoice?: { invoice_id?: string; external_status?: string; pdf_url?: string; billing_provider_error?: string } | null;
 };
 
 export function toInvoiceView(i: RawInvoice, scale = 1): InvoiceView {
@@ -434,7 +437,7 @@ export function toInvoiceView(i: RawInvoice, scale = 1): InvoiceView {
       name: l.name, type: l.type, quantity: l.quantity, unitPriceEur: l.unit_price === undefined ? undefined : l.unit_price / scale, totalEur: round2(l.total / scale),
       productId: l.product_id, isProrated: l.is_prorated, appliedCommitOrCreditId: l.applied_commit_or_credit?.id, startingAt: l.starting_at, endingBefore: l.ending_before,
     })),
-    stripeInvoiceId: i.external_invoice?.invoice_id ?? undefined, stripeStatus: i.external_invoice?.external_status ?? undefined, pdfUrl: i.external_invoice?.pdf_url ?? undefined,
+    stripeInvoiceId: i.external_invoice?.invoice_id ?? undefined, stripeStatus: i.external_invoice?.external_status ?? undefined, stripeError: i.external_invoice?.billing_provider_error ?? undefined, pdfUrl: i.external_invoice?.pdf_url ?? undefined,
   };
 }
 

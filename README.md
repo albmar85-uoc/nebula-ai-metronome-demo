@@ -156,7 +156,7 @@ curl -X POST localhost:3000/api/webhooks/metronome -H 'content-type: application
 | `METRONOME_LIVE=1` | yes | Enables live mode (without it the demo stays mocked even with a token). |
 | `METRONOME_API_KEY` (or `METRONOME_API_TOKEN` / `METRONOME_BEARER_TOKEN`) | yes | Metronome **Sandbox** token connected to Stripe test mode (**Metronome expert**). |
 | `METRONOME_IDS_FILE` | no | Path to the IDs file. |
-| `METRONOME_WEBHOOK_SECRET` | yes | Secret of the webhook pointing to `https://<app>/api/webhooks/metronome`. |
+| `METRONOME_WEBHOOK_SECRET` | once public | Secret of the webhook pointing to `https://<app>/api/webhooks/metronome` (needs a public URL: tunnel or deployment). Until then live mode polls balances; `scripts/live-server.sh` generates a local secret for replaying signed payloads. |
 | `STRIPE_SECRET_KEY` | yes | Secret key of the **same Stripe account** connected to Metronome (**Stripe expert**). |
 | `APP_URL` | recommended | Public URL for Stripe return URLs. |
 | `ADMIN_PASSWORD` | recommended | Support panel password (default `nebula-admin`). |
@@ -226,23 +226,58 @@ Burn-down priorities (same as the setup): plan 1 → promo/goodwill 3 → bundle
 - `npm test` (vitest): `mock-billing` (billing semantics incl. the expert decisions), `webhooks`, `metronome-helpers` (**parity with `metronome-setup/dry-run-helpers.txt`**, ID loading incl. `display_name`/`promotions`, catalog parity with the setup), `support-api-limits` (recommender, spend limit, support actions, API keys, public API), `demo-controls` (personas, spike → early charge / auto-recharge / cut-off, fast-forward month close, reset).
 - `npm run test:e2e` (Playwright, system Chrome): full journey — Free sign-up → usage until blocked (402) → upgrade to Pro → bundle purchase → `WELCOME10` → API key + cookie-less `fetch` like curl (401/200/idempotent replay) → spend limit 402 → key revocation → admin goodwill credit; plus accessibility (axe WCAG 2.1 A/AA, no serious/critical issues) and 390 px mobile checks on every page (including the drawer and the tour), keyboard skip link and focus, low-balance modal focus/Escape; and the presenter tooling: Shift+D, reset, personas, spike on Scale/Pro, fast-forward, toasts, and the 10-step tour across pages.
 
+## Live mode verified (Metronome Sandbox + Stripe test, 2026-09-25)
+
+Run it with `scripts/live-server.sh` (port 3001, own build `.next-live` and data `data-live/`, credentials from `.env.local`,
+which always wins over variables exported in your shell). With a Stripe **test** key it also enables
+`POST /api/stripe/test-signup` (`{ plan, testCard: "pm_card_visa" | "pm_card_authenticationRequired" | … }`): sign-up
+without the hosted Checkout page, names forced to "Nebula demo …". The mock demo on :3000 is unaffected.
+
+**Verified live**
+- Environment is `SANDBOX`. `metronome-ids.json` (final) loads, and the catalog and promotions come from it.
+- Sign-up (Free, Pro): Stripe customer + default PM → Metronome customer (ingest alias = app user id, Stripe billing config) → plan contract (`uniqueness_key` per customer) → 20 % alert per plan.
+- Ingest: one event per request, `transaction_id` = request id; re-sends are deduplicated (locally and by Metronome). Balance drops within ~15 s (Free €5 → €0.90 → €0).
+- Balances: `customerBalances/list` **rejects `limit` > 25** (undocumented) → the adapter uses pages of 25 (`BALANCES_PAGE_LIMIT`).
+- Alerts: without webhooks, balances are **polled** on each `/api/me` (10 s cache per customer, refreshed by every write). Crossing 20 % → `low_balance`, reaching €0 → `zero_balance`, both once per contract period. Metronome's own alert status agrees (`/v1/customer-alerts/list`: 20 % and €0 `in_alarm` at exactly €0). On upgrade, the Free 20 % alert is replaced by the Pro one.
+- Free cut-off: at €0 the next request is rejected (`blocked`, 402 on the public API).
+- Upgrade Free→Pro and Pro→Scale (`RENEWAL` transition): the whole balance carries over (€5 + €30; €30 + €250), the new plan credits are added, and the Scale contract has the €300 spend threshold with the Stripe payment gate.
+- Plan fee: subscription `ADVANCE`, `is_prorated: true`, `BILL_IMMEDIATELY` → a `SCHEDULED` invoice ("nebula Pro plan", €29) finalized at contract start. The next period's fee shows on the current draft (billed in advance, **not** a double charge).
+- WELCOME10: €10 until +30 days; a second redeem gives "You have already redeemed the code WELCOME10".
+- Auto-recharge config: accepted, including `duration` 12 months and `rollover_fraction` 1 (not in SDK 3.10.0 typings). Can be turned off.
+- Invoices: listing, draft preview (English line names, "Free credits applied" lines), 30-day usage from `/v1/usage`.
+- Webhook handler: signed replays (local secret) → processed, duplicate detected, bad signature rejected with 401.
+
+**Differs from mock**
+- Billing periods are **anniversary-based** (contract start = sign-up hour, floored), not calendar months, and the first period isn't prorated (full plan credits). The spend limit now uses the contract period from the draft invoice.
+- The last request before €0 can overshoot. Metronome bills the excess on the Free contract (e.g. €2.50 overage on the draft). The mock never charges Free. A decision is needed (see below).
+- A finalized invoice that Stripe rejects shows as **"payment failed"** (from `external_invoice.external_status` / `billing_provider_error`), with an English customer alert. The raw provider error is only shown in the admin panel.
+- A failed bundle payment gate is **synchronous**: `/v2/contracts/edit` returns 400 and no commit is created. The API answers **402** `{ code: "payment_failed", error: "Payment failed: we couldn't charge your card for the €50.00 bundle, so nothing was added…" }`. The purchase is marked failed and the UI shows the message.
+- A successful bundle is confirmed by polling `findBundleCommit`, both right after the purchase and on reads, because payment webhooks can't arrive yet.
+
+**Not verified: blocked or needs setup**
+- **Any successful charge** (plan fee, bundle, auto-recharge top-up, Scale threshold charge, 3DS). Metronome and the Stripe keys were first on different accounts (Metronome `acct_1T56leGe…`, keys `acct_1T56lXGb…`): fee invoices ended `INVALID_REQUEST_ERROR "No such customer"` and the bundle gate failed with "could not read the default payment method… No such customer". After the keys were switched to `acct_1T56leGe…`, Metronome **started rejecting customer creation** with `404 The specified customer was not found`, for every Stripe customer, including the Metronome expert's own previously accepted `Test Customer` (`/v1/customers` with `customer_billing_provider_configurations`, `direct_to_billing_provider` or explicit `delivery_method_id`). So no matched customer could be created. The Metronome ↔ Stripe connection needs checking (test mode vs live mode?).
+- **Webhooks from Metronome**: they need a public URL (a tunnel such as cloudflared or ngrok, or a deployment) and the secret from the dashboard (`METRONOME_WEBHOOK_SECRET`). Until then the app polls.
+- **Integration rule** `stripe_product_id → invoiceitem.price` (Metronome dashboard, pending): Stripe invoice items won't be tied to Stripe products/prices until it's set.
+- Fee proration on upgrade: the test customers were upgraded in the same hour as sign-up, so the prorated fee equals the full fee. Check with a customer that is at least a day into its period.
+
 ## Open TODOs
 
-Marked in code as `// TODO(verificar)` or described here:
+Described here (design points are marked in code as "Open design point"):
 
-1. **Nothing in live mode has run against real Metronome** (no credentials). Bodies match the setup's (validated against the spec) and the SDK types, but a Sandbox pass is pending.
-2. **Outdated SDK types**: `duration` and `rollover_fraction` on the auto-recharge commit are in the spec but not in `@metronome/sdk` 3.10.0 typings; sent outside the type.
+1. **Live mode** was verified in the Sandbox except for successful charges and webhook delivery (see "Live mode verified").
+2. **Outdated SDK types**: `duration` and `rollover_fraction` on the auto-recharge commit are sent outside the SDK type (verified accepted live).
 3. **Fee credit on upgrade** via transition: the mock credits the unused part of the previous fee; confirm what Metronome does with FIRST_AND_LAST proration.
 4. **Cancelling a scheduled downgrade** in live mode needs archiving the future contract (`/v1/contracts/archive`), which isn't in the setup helpers; the app asks the user to contact support.
-5. **Payment webhook matching**: `payment_gate.payment_status` has no purchase id; checked via `findBundleCommit`. Validate in the Sandbox.
+5. **Payment webhook matching**: `payment_gate.payment_status` has no purchase id; checked via `findBundleCommit` (also used by polling). Failed gates are synchronous (verified); successful ones are pending a working Stripe connection.
 6. **Promo credits with rollover**: do they keep their expiry after a plan transition?
-7. **Alerts**: confirm whether the €0 alert fires at 0 or only below. End-of-month sign-ups can start below the fixed 20% threshold and notify immediately.
+7. **Alerts**: the €0 alert is `in_alarm` at exactly €0 (verified). End-of-month sign-ups can start below the fixed 20% threshold and notify immediately.
 8. **Auto-recharge and spend threshold** treated as mutually exclusive (like the setup); confirm. Auto-recharge minimums are documented in $; assumed the same in EUR.
 9. **30-day usage in live mode**: `/v1/usage` gives quantities; the daily cost is estimated with the rate and plan discount.
-10. **Spend limit** is enforced by the app with locally tracked usage per calendar month (UTC); live mode should use the contract period and could use a Metronome spend/usage alert instead.
+10. **Spend limit** is enforced by the app with locally tracked usage; live mode uses the contract period (anniversary). A Metronome spend/usage alert could replace it.
 11. **Goodwill credit** uses the `promo_credit` product; a dedicated `goodwill_credit` product in the setup would separate it in reports.
 12. **Admin customer list** in live mode reads each customer's balance from Metronome; needs pagination/caching at scale. The admin password is a demo mechanism, not real auth.
 13. **Stripe 3D Secure**: shown as a notice, no link to complete the payment yet.
 14. **Enterprise**: the request is only stored locally; `createEnterpriseContract` is not called from the web app.
 15. **Persistence**: `data/db.json` is single-process; multiple instances need a real database.
 16. **Demo clock** is mock-only and global (all mock accounts move together). There's no live equivalent: in a Metronome Sandbox you'd wait for the period end or create contracts with past start dates.
+17. **Free overshoot**: the request that crosses €0 is accepted and Metronome bills the excess on the Free contract (seen live: €2.50). Options: reserve an estimated cost before each request, or have the Free contract not bill usage beyond its credits (Metronome expert).

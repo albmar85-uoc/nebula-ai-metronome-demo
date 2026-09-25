@@ -7,3 +7,6 @@ data
 .next-e2e
 test-results
 playwright-report
+.env*.local
+data-live
+.next-live

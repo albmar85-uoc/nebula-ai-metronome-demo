@@ -11,7 +11,7 @@ import { AUTO_RECHARGE, BUNDLES, PLANS, PROMOTIONS, SPEND_THRESHOLD, eur, type B
 import type { Invoice } from "@/lib/billing/types";
 
 const STATUS: Record<Invoice["status"], { label: string; cls: string }> = {
-  paid: { label: "paid", cls: "ok" }, pending: { label: "pending", cls: "warn" }, draft: { label: "draft", cls: "" }, void: { label: "void", cls: "bad" },
+  paid: { label: "paid", cls: "ok" }, pending: { label: "pending", cls: "warn" }, draft: { label: "draft", cls: "" }, void: { label: "void", cls: "bad" }, failed: { label: "payment failed", cls: "bad" },
 };
 
 function Billing({ a }: { a: AccountView }) {

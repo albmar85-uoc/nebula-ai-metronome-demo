@@ -6,8 +6,8 @@ import { listCustomerKeys } from "@/lib/store";
 export const dynamic = "force-dynamic";
 /**
  * Lista de clientes para soporte. Simulado: todas las cuentas de db.json. En vivo: los clientes enlazados en la app;
- * cada fila consulta saldos/contrato en Metronome (TODO(verificar): paginar y cachear, o usar /v1/customers + un
- * informe de saldos, si hay muchos clientes).
+ * cada fila consulta saldos/contrato en Metronome (each row uses the 10 s account cache; with many
+ * customers, paginate or use /v1/customers + a balances report instead: fine for a demo with a handful of customers).
  */
 export async function GET(req: Request) {
   const q = new URL(req.url).searchParams.get("q")?.toLowerCase().trim() ?? "";
