@@ -62,7 +62,8 @@ test("balance modal: focus inside, Escape closes, notices in an aria-live region
   await signupViaApi(page, "free");
   await page.goto("/dashboard");
   await expect(page.locator('[aria-live="polite"]').first()).toBeAttached();
-  await page.request.post("/api/usage", { data: { requests: [{ requestId: `a11y-${Date.now()}`, images: 125 }] } }); // uses up the balance
+  const left = (await (await page.request.get("/api/me")).json()).balance as number; // Free credits are prorated in the first month
+  await page.request.post("/api/usage", { data: { requests: [{ requestId: `a11y-${Date.now()}`, inputTokens: Math.round(left * 500_000) }] } }); // uses up exactly the balance
   await page.reload();
   const dialog = page.getByRole("dialog", { name: /out of balance/i });
   await expect(dialog).toBeVisible();

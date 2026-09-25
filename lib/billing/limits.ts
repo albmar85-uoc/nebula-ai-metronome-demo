@@ -19,6 +19,21 @@ export function requestCost(r: UsageRequest, discount: number) {
   return parts.reduce((s, [m, q]) => s + (q > 0 ? METRICS[m].pricePerUnit * q * (1 - discount) : 0), 0);
 }
 
+/** Worst-case cost of a request: known input tokens and images, output tokens capped by max_tokens (maxOutputTokens). */
+export function maxRequestCost(r: UsageRequest, discount: number) {
+  return requestCost({ ...r, outputTokens: Math.max(r.outputTokens ?? 0, r.maxOutputTokens ?? 0) }, discount);
+}
+
+/**
+ * Prepaid-only plans (Free, and Pro without auto-recharge) must never go below €0, so they never bill overage: a request is
+ * accepted only if the remaining balance covers its worst-case cost. Plans with overage (Scale) or auto-recharge on
+ * always pass (the top-up / month-end invoice covers the excess).
+ */
+export function coversWorstCase(p: { overage: boolean; autoRecharge?: boolean }, balanceEur: number, r: UsageRequest, discount: number) {
+  if (p.overage || p.autoRecharge) return true;
+  return maxRequestCost(r, discount) <= balanceEur + 1e-9;
+}
+
 /** true si la petición cabe en el límite (sin límite siempre cabe). */
 export const fitsCap = (cap: SpendCap | undefined, spent: number, cost: number) => !cap || spent + cost <= cap.monthlyEur + 1e-9;
 

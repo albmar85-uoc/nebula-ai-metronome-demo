@@ -6,7 +6,7 @@ import { createHash } from "node:crypto";
 import { BUNDLES, METRICS, PLANS, eur, type MetricId, type PlanId } from "../catalog";
 import { addAlert, addPlanEvent, addPurchase, claimRequestIds, getAlerts, getLink, getPurchase, pendingPurchases, read, resolvePurchase, saveLink, tx, findLinkByMetronomeId, type CustomerLink } from "../store";
 import { recommendPlan, usageLast30DaysFromDaily } from "./insights";
-import { capAlerts, capMessage, fitsCap, normalizeCap, periodSpend, requestCost } from "./limits";
+import { capAlerts, capMessage, coversWorstCase, fitsCap, normalizeCap, periodSpend, requestCost } from "./limits";
 import { loadMetronomeIds, planDisplayName, promotionFromIds } from "./metronome-config";
 import * as H from "./metronome-helpers";
 import type { CreditGrantView, InvoiceView } from "./metronome-types";
@@ -323,12 +323,25 @@ export const metronomeBilling: BillingProvider = {
     const plan = PLANS[link.plan];
     // Corte duro Free/Pro (lo hace la app; Metronome no bloquea): webhook de saldo 0 + consulta del saldo neto.
     const blocked = { rejected: true, reason: "blocked" as RejectReason, duplicates: 0, accepted: [] as string[] };
+    let remaining = Infinity, autoRecharge = false;
     if (!plan.overage) {
       if (link.accessCut) return { account: await toAccount(link), ...blocked };
       const net = await H.getNetBalanceEur(ctx(), link.metronomeCustomerId);
       if (net <= 0) return { account: await toAccount(link), ...blocked };
+      remaining = net;
+      autoRecharge = cache.get(appUserId)?.account.autoRecharge
+        ?? !!(await H.getContract(ctx(), link.metronomeCustomerId, link.metronomeContractId)).prepaid_balance_threshold_configuration?.is_enabled;
     }
-    const valid = requests.filter(r => r.requestId);
+    // Prepaid-only plans never go below €0 (so Metronome never bills them overage): accept a request only if the
+    // remaining balance covers its worst-case cost (input + max_tokens output + images). Duplicates cost nothing.
+    let lowBalance = false;
+    const candidates = requests.filter(r => r.requestId);
+    const valid: UsageRequest[] = [];
+    for (const r of candidates) {
+      if (!coversWorstCase({ overage: plan.overage, autoRecharge }, remaining, r, plan.discount)) { lowBalance = true; break; }
+      if (remaining !== Infinity) remaining -= requestCost(r, plan.discount);
+      valid.push(r);
+    }
     // Límite de gasto del cliente (regla de la app): con la copia local del uso del periodo, a precio de plan.
     // Verified live: contract periods are anniversary-based (signup hour), so the cap uses the contract period start.
     let capHit = false;
@@ -363,7 +376,7 @@ export const metronomeBilling: BillingProvider = {
         for (const k of kinds) localAlert(link.metronomeCustomerId, "spend_cap", capMessage(k, cap, spent, eur), `cap${k}_${appUserId}_${periodStart.slice(0, 7)}`);
       }
     }
-    return { account: await toAccount(getLink(appUserId)!), rejected: capHit, reason: capHit ? "spend_cap" : undefined, duplicates: inCap.length - todo.length, accepted: todo.map(r => r.requestId) };
+    return { account: await toAccount(getLink(appUserId)!), rejected: capHit || lowBalance, reason: lowBalance ? "insufficient_balance" : capHit ? "spend_cap" : undefined, duplicates: inCap.length - todo.length, accepted: todo.map(r => r.requestId) };
   },
   async setSpendCap(appUserId, monthlyEur) {
     // Regla de la app (Metronome no rechaza peticiones). El aviso del 80 % lo emite la app al ingerir.

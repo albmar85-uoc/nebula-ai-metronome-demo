@@ -125,18 +125,39 @@ describe("burn-down order: plan → promo → gift → commit", () => {
 });
 
 describe("blocking at 0 (Free and Pro)", () => {
-  it.each(["free", "pro"] as const)("%s: se bloquea y rechaza nuevas peticiones", async plan => {
-    const a = await b.signup({ name: "A", email: "a@x", plan });
-    const r = await b.ingest(a.customerId, img(5000));
+  it("free: a request that uses exactly the balance is accepted, then the account is blocked", async () => {
+    const a = await b.signup({ name: "A", email: "a@x", plan: "free" });
+    const r = await b.ingest(a.customerId, img(125)); // 125 × €0.04 = €5
+    expect(r.rejected).toBe(false);
     expect(balance(r.account)).toBe(0);
     expect(r.account.blocked).toBe(true);
     expect(r.account.overageAccrued).toBe(0);
     expect(r.account.alerts[0].type).toBe("zero_balance");
-    expect((await b.ingest(a.customerId, img(1))).rejected).toBe(true);
+    const again = await b.ingest(a.customerId, img(1));
+    expect(again.rejected).toBe(true);
+    expect(again.reason).toBe("blocked");
+  });
+  it.each(["free", "pro"] as const)("%s: a request the balance can't cover is rejected up front (never below €0, no overage)", async plan => {
+    const a = await b.signup({ name: "A", email: "a@x", plan });
+    const before = balance(a);
+    const r = await b.ingest(a.customerId, img(5000));
+    expect(r.rejected).toBe(true);
+    expect(r.reason).toBe("insufficient_balance");
+    expect(balance(r.account)).toBe(before);
+    expect(r.account.overageAccrued).toBe(0);
+    expect(r.account.usage).toHaveLength(0);
+  });
+  it("pro: fills the balance down to what's left, then rejects the next request; balance stays ≥ €0", async () => {
+    const a = await b.signup({ name: "A", email: "a@x", plan: "pro" });
+    expect((await b.ingest(a.customerId, img(833))).rejected).toBe(false); // 833 × €0.036 = €29.988
+    const r = await b.ingest(a.customerId, img(1));
+    expect(r.reason).toBe("insufficient_balance");
+    expect(balance(r.account)).toBeGreaterThanOrEqual(0);
+    expect(r.account.overageAccrued).toBe(0);
   });
   it("buying a bundle unblocks the account", async () => {
     const a = await b.signup({ name: "A", email: "a@x", plan: "free" });
-    await b.ingest(a.customerId, img(500));
+    await b.ingest(a.customerId, img(125));
     const r = await b.buyBundle(a.customerId, "b50", "pur_unblock");
     expect(r.blocked).toBe(false);
     expect(balance(r)).toBe(55);

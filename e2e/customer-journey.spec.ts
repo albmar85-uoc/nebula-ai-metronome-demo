@@ -28,14 +28,22 @@ test("sign-up on the Free plan", async () => {
   expect((await me(page)).plan).toBe("free");
 });
 
-test("simulated usage until the balance runs out: access paused and 402", async () => {
+test("simulated usage until the balance runs out: never below €0, access paused and 402", async () => {
   await page.getByLabel(/Intensity/).fill("20");
   const blocked = page.getByText("Your balance is zero and API access is paused");
-  for (let i = 0; i < 40 && !(await blocked.isVisible()); i++) {
+  const cantCover = page.getByRole("alert").filter({ hasText: "your remaining balance can't cover this request" });
+  for (let i = 0; i < 40 && !(await blocked.isVisible()) && !(await cantCover.isVisible()); i++) {
     await page.getByRole("button", { name: "Send 1 request" }).click();
     await page.waitForTimeout(150);
   }
+  // Free never bills overage: a request the balance can't cover is rejected up front, so the balance stays ≥ €0.
+  expect((await me(page)).balance).toBeGreaterThanOrEqual(0);
+  // Use up exactly what's left (input tokens at €2/M) → €0 → access paused.
+  const left = (await me(page)).balance;
+  if (left > 0) await page.request.post("/api/usage", { data: { requests: [{ requestId: `e2e-rest-${Date.now()}`, inputTokens: Math.round(left * 500_000) }] } });
+  await page.reload();
   await expect(blocked).toBeVisible();
+  expect((await me(page)).balance).toBe(0);
   expect((await me(page)).blocked).toBe(true);
   await page.getByRole("button", { name: "Send 1 request" }).click();
   await expect(page.getByRole("alert").filter({ hasText: "Request rejected (402): balance used up" })).toBeVisible();

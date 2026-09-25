@@ -49,7 +49,17 @@ export async function findCustomerByIngestAlias(ctx: Ctx, ingestAlias: string) {
 export async function createCustomerWithStripe(ctx: Ctx, input: CreateCustomerInput): Promise<CustomerRef> {
   const existing = await findCustomerByIngestAlias(ctx, input.ingestAlias);
   if (existing) return { metronomeCustomerId: existing.id, ingestAlias: input.ingestAlias, stripeCustomerId: input.stripeCustomerId };
-  const res = await ctx.client.v1.customers.create(buildCreateCustomerBody(input));
+  let res;
+  try {
+    res = await ctx.client.v1.customers.create(buildCreateCustomerBody(input));
+  } catch (e) {
+    // Seen live: with a Stripe billing config, Metronome masks the Trial limit ("Trial accounts are limited to 5 active
+    // customers") as 404 "The specified customer was not found". Make the log actionable.
+    if (/specified customer was not found/i.test((e as Error).message)) {
+      throw new Error(`${(e as Error).message}. Metronome also returns this when the account's active-customer limit is reached (Trial: 5 active customers; archive unused ones) or when the Stripe customer isn't in the connected Stripe account/mode.`);
+    }
+    throw e;
+  }
   return { metronomeCustomerId: res.data.id, ingestAlias: input.ingestAlias, stripeCustomerId: input.stripeCustomerId };
 }
 

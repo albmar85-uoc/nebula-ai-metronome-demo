@@ -177,7 +177,7 @@ export async function trafficSpike(customerId: string) {
   const cost = round2(r.accepted.length * perCost);
   const outcome = early.length ? `early charge of ${eur(early.reduce((s, i) => s + i.amount, 0))} (spend threshold)`
     : recharge.length ? `auto-recharge charged ${eur(recharge.reduce((s, i) => s + i.amount, 0))}`
-    : r.rejected ? (r.reason === "spend_cap" ? "stopped by the monthly spend limit (402)" : "balance used up, API access paused (402)")
+    : r.rejected ? (r.reason === "spend_cap" ? "stopped by the monthly spend limit (402)" : r.reason === "insufficient_balance" ? "stopped: the remaining balance can't cover the next request, never goes below €0 (402)" : "balance used up, API access paused (402)")
     : "absorbed by the balance";
   return { summary: `Traffic spike: ${r.accepted.length} requests (${eur(cost)}) → ${outcome}.`, accepted: r.accepted.length, rejected: r.rejected, reason: r.reason, earlyCharges: early.length };
 }

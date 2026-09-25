@@ -69,11 +69,12 @@ export type Account = {
 export type SpendCap = { monthlyEur: number; alerted80At?: string; alerted100At?: string };
 /** Quién hace una acción de cuenta (para el historial y el registro de soporte). */
 export type Actor = "customer" | "support" | "system";
-export type RejectReason = "blocked" | "spend_cap";
+export type RejectReason = "blocked" | "spend_cap" | "insufficient_balance";
 
 export type SignupInput = { name: string; email: string; plan: PlanId; stripeCustomerId?: string };
 /** Una petición de IA de la app. requestId es el id de la petición y se usa como transaction_id en /v1/ingest. */
-export type UsageRequest = { requestId: string; inputTokens?: number; outputTokens?: number; images?: number; model?: string; ts?: string; source?: UsageSource };
+/** maxOutputTokens: upper bound for output (e.g. max_tokens) used to reserve the worst-case cost on prepaid-only plans. */
+export type UsageRequest = { requestId: string; inputTokens?: number; outputTokens?: number; maxOutputTokens?: number; images?: number; model?: string; ts?: string; source?: UsageSource };
 
 export interface BillingProvider {
   mode: "mock" | "metronome";

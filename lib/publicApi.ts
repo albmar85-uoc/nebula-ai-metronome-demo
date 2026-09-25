@@ -7,7 +7,7 @@ import { authenticate } from "./apikeys";
 import { billing } from "./billing";
 import { balance } from "./billing/mock";
 import { round2 } from "./billing/insights";
-import { requestCost } from "./billing/limits";
+import { maxRequestCost, requestCost } from "./billing/limits";
 import { PLANS } from "./catalog";
 import type { UsageRequest } from "./billing/types";
 
@@ -31,7 +31,7 @@ export function parseCompletion(body: Record<string, unknown>): ParsedCall | str
   if (!Number.isInteger(max) || (max as number) < 1 || (max as number) > 4096) return "\"max_tokens\" must be an integer between 1 and 4096";
   const inputTokens = estimateTokens(body.prompt), outputTokens = max as number;
   return {
-    usage: { requestId: "", inputTokens, outputTokens, model: MODELS.text },
+    usage: { requestId: "", inputTokens, outputTokens, maxOutputTokens: max as number, model: MODELS.text },
     respond: id => ({
       id, object: "text_completion", created: Math.floor(Date.now() / 1000), model: MODELS.text,
       choices: [{ index: 0, text: "This is a simulated nebula-1 response. There is no real model in this demo: only usage is recorded.", finish_reason: "length" }],
@@ -75,6 +75,11 @@ export async function handlePublicCall(req: Request, parse: (b: Record<string, u
   try { r = await billing.ingest(key.customerKey, [usage]); }
   catch (e) { return err(404, "not_found", (e as Error).message); }
   if (r.rejected) {
+    if (r.reason === "insufficient_balance") {
+      const worst = round2(maxRequestCost(usage, PLANS[r.account.plan].discount) * 10000) / 10000;
+      const bal = round2(balance(r.account));
+      return err(402, "insufficient_balance", `Insufficient balance: this request could cost up to €${worst.toFixed(4)} and your balance is €${bal.toFixed(2)}. Your plan never bills beyond your balance, so the request was not run. Lower max_tokens, top up or upgrade.`, { balance_eur: bal, max_cost_eur: worst });
+    }
     return r.reason === "spend_cap"
       ? err(402, "spend_limit_reached", "You've reached your monthly spend limit. Raise it in Billing or wait for the next period.", { spend_cap_eur: r.account.spendCap?.monthlyEur })
       : err(402, "insufficient_balance", "Balance used up: API access is paused. Top up or upgrade.", { balance_eur: balance(r.account) });

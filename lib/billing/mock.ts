@@ -8,7 +8,7 @@
 //  - alertas del 20 % (por plan) y de 0 €, corte de acceso en Free/Pro; ingesta idempotente por id de petición.
 import { AUTO_RECHARGE, BUNDLES, LOW_BALANCE_RATIO, METRICS, PLANS, PROMOTIONS, SPEND_THRESHOLD, eur, type BundleId, type MetricId, type PlanId } from "../catalog";
 import { addPlanEvent, addPurchase, getAccount, getAlerts, getPurchase, pendingPurchases, resolvePurchase, saveAccount } from "../store";
-import { capAlerts, capMessage, fitsCap, normalizeCap, periodSpend, requestCost } from "./limits";
+import { coversWorstCase, capAlerts, capMessage, fitsCap, normalizeCap, periodSpend, requestCost } from "./limits";
 import { recommendPlan, round2, usageLast30DaysFromDaily } from "./insights";
 import type { InvoiceLineView, UpcomingInvoicePreview } from "./metronome-types";
 import type { Account, Alert, BillingProvider, RejectReason, CreditGrant, DailyUsage, Invoice, InvoiceLine, UsageRequest } from "./types";
@@ -457,6 +457,8 @@ export const mockBilling: BillingProvider = {
       if (seen.has(r.requestId)) { duplicates++; continue; } // igual que /v1/ingest: dedupe por transaction_id
       refreshBlocked(a);
       if (a.blocked) { rejected = true; reason = "blocked"; break; }
+      // Prepaid-only plans never go below €0: reject if the balance can't cover the worst case (max_tokens).
+      if (!coversWorstCase({ overage: plan.overage, autoRecharge: a.autoRecharge }, balance(a), r, plan.discount)) { rejected = true; reason = "insufficient_balance"; break; }
       // Límite de gasto del cliente: se rechaza la petición que lo superaría (la API responde 402).
       if (!fitsCap(a.spendCap, periodSpend(a.daily, a.periodStart), requestCost(r, plan.discount))) {
         rejected = true; reason = "spend_cap";

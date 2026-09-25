@@ -26,7 +26,7 @@ function Dashboard({ a }: { a: AccountView }) {
   async function tick() {
     // Cada petición lleva su id (→ transaction_id en Metronome): si se reintenta, no se cobra dos veces.
     const r = await api("/api/usage", { simulate: true, intensity, requestId: `req_${crypto.randomUUID()}` });
-    if (r.rejected) { setMsg(r.reason === "spend_cap" ? "Request rejected (402): you've reached your monthly spend limit." : "Request rejected (402): balance used up."); stop(); } else setMsg("");
+    if (r.rejected) { setMsg(r.reason === "spend_cap" ? "Request rejected (402): you've reached your monthly spend limit." : r.reason === "insufficient_balance" ? "Request rejected (402): your remaining balance can't cover this request, and your plan never bills beyond your balance. Top up or upgrade." : "Request rejected (402): balance used up."); stop(); } else setMsg("");
   }
   function start() { setRunning(true); timer.current = setInterval(() => tick().catch(() => stop()), 900); }
   function stop() { setRunning(false); if (timer.current) clearInterval(timer.current); timer.current = null; }
