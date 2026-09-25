@@ -5,7 +5,7 @@ Demo of a fictional SaaS, **nebula.ai**, that sells a generative-AI API (text an
 - **Mock mode** (default): no external calls. It reproduces the agreed Metronome + Stripe behavior locally and stores data in `./data/db.json`, so it survives restarts.
 - **Live mode** (Metronome live): calls the real Metronome API with the official SDK [`@metronome/sdk`](https://www.npmjs.com/package/@metronome/sdk) and uses Stripe Checkout in *setup* mode to save the card.
 
-Every screen shows a **"Mock mode"** (amber) or **"Metronome live"** (green) badge.
+Every screen shows a **"Simulated mode"** (amber) or **"Live Metronome"** (green) badge; "simulated" and "mock" mean the same thing here.
 
 ## Catalog (sample data)
 
@@ -26,6 +26,21 @@ Plan credits are prorated in the first month and expire monthly. Bundles, gifts 
 2. **Auto-recharge** (Pro/Scale): when the balance drops **below €10**, it is **topped up to €50**, charging only the difference (e.g. balance €7.40 → charge €42.60). No gift. Gift credit only comes with **manually purchased** bundles.
 
 Catalog names, promo codes and amounts are identical to the expert's (English) setup package. In live mode the app reads `catalog.plans[].display_name`, `catalog.bundles[].display_name` and `catalog.promotions` from `metronome-ids.json`; a test checks that `lib/catalog.ts` matches the setup's `metronome-ids.dry-run.json`.
+
+## Presenting the demo
+
+See **[DEMO_SCRIPT.md](DEMO_SCRIPT.md)** for a 10-minute presenter script (click path, the Metronome feature behind each step, likely audience questions).
+
+- **Demo controls** (mock mode only): floating button at the bottom left, or **Shift+D**.
+  - **Personas**: Free hobbyist near the limit · Pro startup with auto-recharge · Scale company with overage · Enterprise prospect. Each one is seeded through the normal billing engine (history, usage, alerts, invoices) and switching signs you in as that customer.
+  - **Fast-forward to month end**: moves the demo clock to the end of the billing period and runs the month close: overage invoice (net of early charges), unused plan credits expire, next fee and recurring credits. It can be repeated (one month each time).
+  - **Traffic spike**: a burst of large requests. On Scale it's sized to push overage past the next €300 step, so the early usage charge (spend threshold) fires. On Pro it triggers auto-recharge; on Free the balance runs out (402).
+  - **Reset demo data**: wipes everything, resets the demo clock and seeds the personas again.
+  - **Start guided tour**.
+- **Guided tour** (no dependencies): 10 steps across pages (pricing, sign-up, usage, alerts, upgrade, bundle, promo, invoice preview, API keys, admin). It highlights each part of the screen and names the Metronome feature behind it. Start it from Demo controls or with `?tour=1`; arrow keys move, Esc ends.
+- **Notifications**: every new alert (local or webhook) and every demo action shows as a toast at the bottom right. Toasts are large, color-coded by severity and announced by screen readers; clicks pass through them. The app polls the account every 5 s in mock mode (20 s live), so alerts caused elsewhere (curl, admin, webhooks) show up without a refresh.
+
+The API behind the controls is `GET/POST /api/demo/controls` (`reset`, `persona`, `fast-forward`, `spike`). It returns 404 in live mode.
 
 ## What's in the app
 
@@ -105,6 +120,8 @@ flowchart LR
 | `lib/apikeys.ts`, `lib/publicApi.ts` | API keys (hash + timing-safe compare) and the fictional `/api/v1` endpoints. |
 | `lib/admin.ts` | Support panel auth (HMAC-signed cookie, rate-limited login) and audit log. |
 | `lib/webhooks.ts` | Signature + `interpretWebhook` → actions. |
+| `lib/demo.ts`, `lib/personas.ts`, `lib/clock.ts` | Demo controls: persona seeding, month close, traffic spike, reset; the demo clock (offset stored in `db.json`, used by every mock timestamp). |
+| `components/DemoControls.tsx`, `Tour.tsx`, `Toaster.tsx`, `toast.ts` | Presenter drawer, guided tour, notifications. |
 | `lib/store.ts` | JSON store with atomic writes. |
 
 ## Run in mock mode
@@ -114,6 +131,7 @@ npm install
 npm run build && npm start      # http://localhost:3000  (or npm run dev)
 npm test                        # unit tests (vitest)
 npm run test:e2e                # end-to-end tests (Playwright, own build on port 3100 and data in /tmp)
+node scripts/screens.mjs        # refresh /workspace/screens (server running; resets demo data)
 ```
 
 - `http://localhost:3000/api/demo` creates a sample Pro account (€50 bundle bought, 30 days of history) and opens the dashboard.
@@ -205,8 +223,8 @@ Burn-down priorities (same as the setup): plan 1 → promo/goodwill 3 → bundle
 
 ## Tests
 
-- `npm test` (vitest): `mock-billing` (billing semantics incl. the expert decisions), `webhooks`, `metronome-helpers` (**parity with `metronome-setup/dry-run-helpers.txt`**, ID loading incl. `display_name`/`promotions`, catalog parity with the setup), `support-api-limits` (recommender, spend limit, support actions, API keys, public API).
-- `npm run test:e2e` (Playwright, system Chrome): full journey — Free sign-up → usage until blocked (402) → upgrade to Pro → bundle purchase → `WELCOME10` → API key + cookie-less `fetch` like curl (401/200/idempotent replay) → spend limit 402 → key revocation → admin goodwill credit; plus accessibility (axe WCAG 2.1 A/AA, no serious/critical issues) and 390 px mobile checks on every page, keyboard skip link and focus, low-balance modal focus/Escape.
+- `npm test` (vitest): `mock-billing` (billing semantics incl. the expert decisions), `webhooks`, `metronome-helpers` (**parity with `metronome-setup/dry-run-helpers.txt`**, ID loading incl. `display_name`/`promotions`, catalog parity with the setup), `support-api-limits` (recommender, spend limit, support actions, API keys, public API), `demo-controls` (personas, spike → early charge / auto-recharge / cut-off, fast-forward month close, reset).
+- `npm run test:e2e` (Playwright, system Chrome): full journey — Free sign-up → usage until blocked (402) → upgrade to Pro → bundle purchase → `WELCOME10` → API key + cookie-less `fetch` like curl (401/200/idempotent replay) → spend limit 402 → key revocation → admin goodwill credit; plus accessibility (axe WCAG 2.1 A/AA, no serious/critical issues) and 390 px mobile checks on every page (including the drawer and the tour), keyboard skip link and focus, low-balance modal focus/Escape; and the presenter tooling: Shift+D, reset, personas, spike on Scale/Pro, fast-forward, toasts, and the 10-step tour across pages.
 
 ## Open TODOs
 
@@ -227,3 +245,4 @@ Marked in code as `// TODO(verificar)` or described here:
 13. **Stripe 3D Secure**: shown as a notice, no link to complete the payment yet.
 14. **Enterprise**: the request is only stored locally; `createEnterpriseContract` is not called from the web app.
 15. **Persistence**: `data/db.json` is single-process; multiple instances need a real database.
+16. **Demo clock** is mock-only and global (all mock accounts move together). There's no live equivalent: in a Metronome Sandbox you'd wait for the period end or create contracts with past start dates.

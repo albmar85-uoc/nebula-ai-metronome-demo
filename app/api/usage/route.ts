@@ -14,7 +14,7 @@ export async function POST(req: Request) {
     const r = (min: number, max: number) => Math.round((min + Math.random() * (max - min)) * scale);
     const withImages = Math.random() < 0.35;
     requests = [{
-      requestId: typeof body.requestId === "string" ? body.requestId : `req_${randomUUID()}`, source: "simulador" as const,
+      requestId: typeof body.requestId === "string" ? body.requestId : `req_${randomUUID()}`, source: "simulator" as const,
       ...(withImages ? { images: Math.max(1, r(1, 12)), model: "nebula-image-1" } : { inputTokens: r(20_000, 400_000), outputTokens: r(10_000, 250_000), model: "nebula-1" }),
     }];
   }

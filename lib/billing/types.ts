@@ -29,7 +29,7 @@ export type Invoice = {
   pdfUrl?: string;
 };
 export type UsageEvent = { id: string; requestId?: string; ts: string; metric: MetricId; quantity: number; cost: number; source?: UsageSource };
-export type UsageSource = "api" | "simulador";
+export type UsageSource = "api" | "simulator";
 export type DailyUsage = { day: string; metric: MetricId; quantity: number; cost: number }; // day = AAAA-MM-DD (UTC)
 export type Alert = { id: string; ts: string; type: "low_balance" | "zero_balance" | "auto_recharge" | "payment" | "info" | "spend_cap" | "support"; message: string; source?: "local" | "webhook"; verified?: boolean };
 

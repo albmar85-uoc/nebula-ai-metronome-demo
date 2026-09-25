@@ -78,7 +78,7 @@ function Keys({ a }: { a: AccountView }) {
             </tbody>
           </table></div>
         </section>
-        <section className="card" aria-labelledby="new-title">
+        <section className="card" aria-labelledby="new-title" data-tour="api-key">
           <h3 id="new-title">Create a key</h3>
           <form onSubmit={create}>
             <label className="f" htmlFor="keyname">Name (so you can recognize it)</label>

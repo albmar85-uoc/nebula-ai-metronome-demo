@@ -92,7 +92,7 @@ function Dashboard({ a }: { a: AccountView }) {
       <div className="sec"><PlanComparison a={a} /></div>
 
       <div className="grid g2 sec">
-        <div className="card">
+        <div className="card" data-tour="usage">
           <h3>Traffic simulator</h3>
           <p className="muted" style={{ fontSize: 14 }}>Generates fake requests and sends them to <code>/api/usage</code>, just like your backend would with Metronome. To call the API for real, create an <Link href="/keys"><u>API key</u></Link> and follow the <Link href="/docs"><u>docs</u></Link>.</p>
           <label className="f" htmlFor="intensity">Intensity: x{intensity}</label>
@@ -105,7 +105,7 @@ function Dashboard({ a }: { a: AccountView }) {
           <div className="label" style={{ marginTop: 18 }}>Cost of the latest requests</div>
           <div className="chart" role="img" aria-label={`Cost of the latest ${recent.length} requests; max ${eur(max)}`}>{recent.map(u => <i key={u.id} title={eur(u.cost)} style={{ height: `${(u.cost / max) * 100}%` }} />)}</div>
         </div>
-        <div className="card">
+        <div className="card" data-tour="alerts">
           <h3>Alerts</h3>
           <p className="muted" style={{ fontSize: 13 }}>{a.mode === "metronome" ? "Delivered as Metronome webhooks." : "Generated locally; in production they arrive as Metronome webhooks."}</p>
           <div aria-live="polite" aria-relevant="additions">
@@ -129,7 +129,7 @@ function Dashboard({ a }: { a: AccountView }) {
           <div className="tablewrap" tabIndex={0}><table aria-labelledby="req-title"><thead><tr><th scope="col">Request</th><th scope="col">Source</th><th scope="col">Details</th><th scope="col" style={{ textAlign: "right" }}>Cost</th></tr></thead>
             <tbody>{lastRequests.length === 0 ? <tr><td colSpan={4} className="muted">No requests yet.</td></tr> : lastRequests.map(r => (
               <tr key={r.id} data-testid="request-row"><td><code style={{ fontSize: 11 }}>{r.id.length > 24 ? `${r.id.slice(0, 24)}…` : r.id}</code><div className="muted" style={{ fontSize: 11 }}>{new Date(r.ts).toLocaleString("en-US", { dateStyle: "short", timeStyle: "medium" })}</div></td>
-                <td>{r.source === "api" ? <span className="badge acc">API</span> : <span className="badge">{r.source === "simulador" ? "simulator" : "—"}</span>}</td>
+                <td>{r.source === "api" ? <span className="badge acc">API</span> : <span className="badge">{r.source === "simulator" ? "simulator" : "—"}</span>}</td>
                 <td style={{ fontSize: 13 }}>{r.parts.map(p => `${fmt(p.quantity)} ${METRICS[p.metric].unit}${p.metric === "input_tokens" ? " in" : p.metric === "output_tokens" ? " out" : ""}`).join(" · ")}</td>
                 <td style={{ textAlign: "right" }}>{eur(r.cost)}</td></tr>))}</tbody></table></div>
         </div>

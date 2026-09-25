@@ -6,6 +6,7 @@
 // o en el enlace del cliente real.
 import { createHmac, timingSafeEqual } from "node:crypto";
 import { eur } from "./catalog";
+import { nowIso } from "./clock";
 import { addAlert, findLinkByMetronomeId, getAccount, isWebhookSeen, markWebhookSeen } from "./store";
 import type { Alert } from "./billing/types";
 import type { MetronomeWebhookEvent } from "./billing/metronome-types";
@@ -54,7 +55,7 @@ export async function handleMetronomeEvent(ev: MetronomeEvent, opts: { verified:
 
   const t = target(act.customerId);
   if (!t) { markWebhookSeen(ev.id); return { status: "unknown_customer", action: act.action }; }
-  const ts = (ev.properties?.timestamp as string | undefined) ?? new Date().toISOString();
+  const ts = (ev.properties?.timestamp as string | undefined) ?? nowIso();
   const push = (type: Alert["type"], message: string) =>
     addAlert(t.key, { id: `wh_${ev.id}`, ts, type, message, source: opts.source ?? "webhook", verified: opts.verified });
   // Carga perezosa del adaptador en vivo (evita cargar el SDK en modo simulado).

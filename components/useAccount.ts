@@ -2,7 +2,7 @@
 import { useCallback, useEffect, useState } from "react";
 import type { Account } from "@/lib/billing/types";
 
-export type AccountView = Account & { balance: number; spent: number; capReached: boolean };
+export type AccountView = Account & { balance: number; spent: number; capReached: boolean; now?: string; clockOffsetMs?: number };
 const listeners = new Set<(a: AccountView | null) => void>();
 let cache: AccountView | null = null;
 const publish = (a: AccountView | null) => { cache = a; listeners.forEach(l => l(a)); };

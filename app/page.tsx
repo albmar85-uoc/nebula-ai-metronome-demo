@@ -13,7 +13,7 @@ export default function Home() {
           <a href="/api/demo" className="btn">Try the demo account</a>
         </div>
       </section>
-      <section id="pricing" className="sec"><h2>Pricing</h2><Pricing /></section>
+      <section id="pricing" className="sec" data-tour="pricing"><h2>Pricing</h2><Pricing /></section>
     </main>
   );
 }

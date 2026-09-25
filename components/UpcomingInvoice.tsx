@@ -9,7 +9,7 @@ export default function UpcomingInvoice({ a }: { a: AccountView }) {
   if (!u) return null;
   const end = u.periodEnd ? new Date(u.periodEnd).toLocaleDateString("en-US", { day: "numeric", month: "long", timeZone: "UTC" }) : "month end";
   return (
-    <div className="card">
+    <div className="card" data-tour="invoice-preview">
       <div className="row"><h3 className="sp" style={{ margin: 0 }}>Next invoice</h3><span className="badge">estimate</span></div>
       <p className="muted" style={{ fontSize: 13 }}>Issued on {end}. Updates in real time with every request.</p>
       <div className="stat">{eur(u.totalDueEur)}</div>

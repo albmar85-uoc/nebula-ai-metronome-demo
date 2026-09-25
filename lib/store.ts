@@ -62,7 +62,13 @@ type DB = {
   apiKeys: ApiKey[];
   planHistory: Record<string, PlanEvent[]>;
   adminLog: AdminLogEntry[];
+  /** Solo modo simulado: reloj de la demo (adelanto respecto al reloj real) y personas sembradas. */
+  demo?: DemoState;
 };
+
+export type { PersonaId } from "./personas";
+import type { PersonaId } from "./personas";
+export type DemoState = { clockOffsetMs: number; personas: Partial<Record<PersonaId, string>> };
 
 const empty = (): DB => ({ version: 1, accounts: {}, links: {}, alerts: {}, usage: {}, purchases: [], seenWebhooks: [], seenRequests: {}, enterpriseLeads: [], apiKeys: [], planHistory: {}, adminLog: [] });
 
@@ -169,3 +175,9 @@ export const listCustomerKeys = (mode: "mock" | "metronome") =>
   read(db => (mode === "mock"
     ? Object.values(db.accounts).sort((a, b) => b.periodStart.localeCompare(a.periodStart)).map(a => a.customerId)
     : Object.values(db.links).sort((a, b) => b.createdAt.localeCompare(a.createdAt)).map(l => l.appUserId)));
+
+// --- Demo (modo simulado) ---
+export const getDemoState = (): DemoState => read(db => db.demo ?? { clockOffsetMs: 0, personas: {} });
+export const setDemoState = (fn: (d: DemoState) => void) => tx(db => { db.demo ??= { clockOffsetMs: 0, personas: {} }; fn(db.demo); });
+/** Borra todos los datos de la demo (cuentas, claves, historial…). */
+export const resetAll = () => tx(db => { Object.assign(db, empty(), { demo: undefined }); });

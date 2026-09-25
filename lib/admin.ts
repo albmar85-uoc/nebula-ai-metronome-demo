@@ -4,6 +4,7 @@ import { createHmac, randomUUID, timingSafeEqual } from "node:crypto";
 import { cookies } from "next/headers";
 import { NextResponse } from "next/server";
 import { addAdminLog } from "./store";
+import { nowIso } from "./clock";
 
 export const ADMIN_COOKIE = "demo_admin";
 export const DEFAULT_ADMIN_PASSWORD = "nebula-admin";
@@ -33,4 +34,4 @@ export async function withAdmin(fn: () => Promise<unknown>) {
 }
 
 export const logAdmin = (customerKey: string, action: string, detail: string) =>
-  addAdminLog({ id: `adm_${randomUUID().slice(0, 8)}`, ts: new Date().toISOString(), customerKey, action, detail });
+  addAdminLog({ id: `adm_${randomUUID().slice(0, 8)}`, ts: nowIso(), customerKey, action, detail });

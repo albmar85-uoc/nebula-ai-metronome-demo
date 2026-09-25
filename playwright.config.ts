@@ -1,6 +1,7 @@
 import { defineConfig, devices } from "@playwright/test";
 
-// E2E contra un servidor propio en :3100 (modo simulado, datos temporales en /tmp) con el Chrome ya instalado.
+// E2E against a dedicated server on :3100 (mock mode, temp data in /tmp) using the installed Chrome.
+// Browser locale es-ES on purpose: the UI must render en-US numbers/dates regardless of the viewer's locale.
 const PORT = Number(process.env.E2E_PORT ?? 3100);
 const DATA_DIR = process.env.E2E_DATA_DIR ?? "/tmp/nebula-e2e-data";
 export const ADMIN_PASSWORD = "e2e-support";

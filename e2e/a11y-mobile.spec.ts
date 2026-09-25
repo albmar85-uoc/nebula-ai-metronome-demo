@@ -71,3 +71,23 @@ test("balance modal: focus inside, Escape closes, notices in an aria-live region
   await expect(dialog).toBeHidden();
   await expect(page.getByRole("status").filter({ hasText: "API access is paused" })).toBeVisible();
 });
+
+test("390 px + axe: demo controls drawer and guided tour", async ({ page }) => {
+  await signupViaApi(page, "pro");
+  await page.goto("/dashboard");
+  await page.getByRole("button", { name: "Demo controls" }).click();
+  const drawer = page.getByRole("dialog", { name: "Demo controls" });
+  await expect(drawer).toBeVisible();
+  await expect(drawer.getByRole("heading", { name: "Demo controls" })).toBeFocused();
+  expect(await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth)).toBeLessThanOrEqual(1);
+  let r = await new AxeBuilder({ page }).include("#demo-drawer").withTags(["wcag2a", "wcag2aa"]).analyze();
+  expect(r.violations.filter(v => v.impact === "serious" || v.impact === "critical").map(v => v.id)).toEqual([]);
+  await drawer.getByRole("button", { name: "Start guided tour" }).click();
+  const tour = page.getByTestId("tour");
+  await expect(tour.getByRole("heading", { name: "Pricing" })).toBeFocused();
+  await expect(tour).toBeInViewport();
+  r = await new AxeBuilder({ page }).include("[data-testid=tour]").withTags(["wcag2a", "wcag2aa"]).analyze();
+  expect(r.violations.filter(v => v.impact === "serious" || v.impact === "critical").map(v => v.id)).toEqual([]);
+  await page.keyboard.press("Escape");
+  await expect(tour).toBeHidden();
+});

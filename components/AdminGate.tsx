@@ -17,7 +17,7 @@ export default function AdminGate({ children }: { children: (logout: () => void)
   if (state === "no") return (
     <main className="wrap" style={{ maxWidth: 440 }}>
       <h2>Support panel</h2>
-      <form className="card" onSubmit={login}>
+      <form className="card" onSubmit={login} data-tour="admin">
         <label className="f" htmlFor="adminpw">Support password</label>
         <input id="adminpw" type="password" autoComplete="current-password" value={pw} onChange={e => setPw(e.target.value)} required aria-describedby="adminpw-help" />
         <p id="adminpw-help" className="muted" style={{ fontSize: 12 }}>Demo: <code>ADMIN_PASSWORD</code> environment variable (default listed in the README).</p>

@@ -1,54 +1,80 @@
-// Seeds demo customers through the app's own API (mock mode) and refreshes the screenshots.
-// Usage: node scripts/screens.mjs [baseUrl] [outDir]   (server must be running; ADMIN_PASSWORD or default)
+// Refreshes the screenshots using the demo controls (mock mode): resets demo data, then walks the personas.
+// Usage: node scripts/screens.mjs [baseUrl] [outDir]   (server running on baseUrl; ADMIN_PASSWORD or default)
 import { chromium } from "@playwright/test";
 const BASE = process.argv[2] ?? "http://localhost:3000";
 const OUT = process.argv[3] ?? "/workspace/screens";
 const ADMIN = process.env.ADMIN_PASSWORD ?? "nebula-admin";
 const browser = await chromium.launch({ executablePath: process.env.CHROME_PATH ?? "/usr/bin/google-chrome", args: ["--no-sandbox"] });
-const ctx = async (vp = { width: 1280, height: 900 }) => (await browser.newContext({ viewport: vp, baseURL: BASE, colorScheme: "dark" }));
-const shot = async (page, name, full = true) => { await page.waitForLoadState("networkidle"); await page.waitForTimeout(400); await page.screenshot({ path: `${OUT}/${name}.png`, fullPage: full }); console.log(`${OUT}/${name}.png`); };
-const dismiss = async page => { const b = page.getByRole("button", { name: "Not now" }); if (await b.isVisible().catch(() => false)) await b.click(); };
+const ctx = (vp = { width: 1280, height: 900 }) => browser.newContext({ viewport: vp, baseURL: BASE, colorScheme: "dark", locale: "en-US" });
+const HIDE = ".toasts{display:none!important}";
+async function shot(page, name, { full = true, toasts = false } = {}) {
+  await page.waitForLoadState("networkidle"); await page.waitForTimeout(450);
+  const tag = toasts ? null : await page.addStyleTag({ content: HIDE });
+  await page.screenshot({ path: `${OUT}/${name}.png`, fullPage: full });
+  if (tag) await tag.evaluate(el => el.remove());
+  console.log(`${OUT}/${name}.png`);
+}
+const dismissModal = async page => { const b = page.getByRole("button", { name: "Not now" }); if (await b.isVisible().catch(() => false)) await b.click(); };
+const control = (page, data) => page.request.post("/api/demo/controls", { data });
+async function as(page, persona) { const r = await (await control(page, { action: "persona", persona })).json(); await page.goto(r.redirect); await dismissModal(page); }
 
-// 1) Pro sample account (bundle + 30 days of history)
-const pro = await ctx(); const p = await pro.newPage();
+const c = await ctx(); const p = await c.newPage();
+await control(p, { action: "reset", persona: "pro" });
 await p.goto("/"); await shot(p, "landing");
-await p.goto("/api/demo"); await p.waitForURL(/dashboard/); await dismiss(p);
-await p.request.post("/api/spend-cap", { data: { monthlyEur: 60 } });
+
+// Pro startup (auto-recharge)
+await as(p, "pro");
 await p.request.post("/api/promo", { data: { code: "WELCOME10" } });
-await p.goto("/dashboard"); await dismiss(p); await shot(p, "dashboard");
-await p.goto("/billing"); await dismiss(p); await shot(p, "billing");
+await p.request.post("/api/spend-cap", { data: { monthlyEur: 150 } });
+await p.goto("/dashboard"); await dismissModal(p); await shot(p, "dashboard");
+await p.goto("/billing"); await dismissModal(p); await shot(p, "billing");
 await p.goto("/billing/invoices/draft-current"); await shot(p, "invoice-draft");
 await p.goto("/keys"); await p.getByLabel("Name (so you can recognize it)").fill("production server");
 await p.getByRole("button", { name: "Create key" }).click(); await p.getByTestId("api-key-secret").waitFor();
 const secret = (await p.getByTestId("api-key-secret").textContent()).trim();
 await p.request.post("/api/keys", { data: { name: "staging" } });
 await shot(p, "api-keys");
-for (let i = 0; i < 3; i++) await pro.request.post("/api/v1/completions", { headers: { Authorization: `Bearer ${secret}` }, data: { prompt: "Write a haiku about invoices ".repeat(20), max_tokens: 300 } });
-await pro.request.post("/api/v1/images", { headers: { Authorization: `Bearer ${secret}` }, data: { prompt: "a lighthouse at dusk", n: 2 } });
+for (let i = 0; i < 3; i++) await c.request.post("/api/v1/completions", { headers: { Authorization: `Bearer ${secret}` }, data: { prompt: "Write a haiku about invoices ".repeat(20), max_tokens: 300 } });
 await p.goto("/docs"); await shot(p, "docs");
-await p.goto("/enterprise"); await shot(p, "enterprise");
-const mob = await ctx({ width: 390, height: 844 }); await mob.addCookies(await pro.cookies());
-const m = await mob.newPage(); await m.goto("/dashboard"); await dismiss(m); await shot(m, "dashboard-mobile");
+const mob = await ctx({ width: 390, height: 844 }); await mob.addCookies(await c.cookies());
+const m = await mob.newPage(); await m.goto("/dashboard"); await dismissModal(m); await shot(m, "dashboard-mobile");
 
-// 2) Free customer that ran out of balance (blocked) → low-balance modal
-const free = await ctx(); const f = await free.newPage();
-await f.request.post("/api/signup", { data: { name: "Maya Chen", email: "maya@example.com", plan: "free" } });
-await f.request.post("/api/usage", { data: { requests: [{ requestId: "seed-free-1", inputTokens: 400000, outputTokens: 200000 }, { requestId: "seed-free-2", images: 80 }] } });
-await f.goto("/dashboard"); await f.getByRole("dialog").waitFor({ timeout: 8000 }).catch(() => {}); await shot(f, "low-balance-modal", false);
+// Guided tour (step 5: Upgrade on /billing)
+await p.goto("/billing"); await dismissModal(p);
+await p.evaluate(() => { localStorage.setItem("nebula-tour", "4"); window.dispatchEvent(new CustomEvent("nebula:tour")); });
+await p.getByTestId("tour").waitFor(); await p.waitForTimeout(700);
+await shot(p, "tour", { full: false });
+await p.keyboard.press("Escape");
 
-// 3) Scale customer with overage
-const scale = await ctx(); const s = await scale.newPage();
-await s.request.post("/api/signup", { data: { name: "Orbit Labs", email: "billing@orbitlabs.example", plan: "scale" } });
-await s.request.post("/api/usage", { data: { requests: Array.from({ length: 12 }, (_, i) => ({ requestId: `seed-scale-${i}`, inputTokens: 9_000_000, outputTokens: 2_500_000, images: 150 })) } });
-await s.goto("/dashboard"); await dismiss(s); await shot(s, "dashboard-scale");
-await s.goto("/billing"); await dismiss(s); await shot(s, "billing-scale");
+// Free hobbyist → runs out of balance → low-balance modal
+await as(p, "free");
+await control(p, { action: "spike" });
+await p.goto("/dashboard"); await p.getByRole("dialog", { name: /balance/i }).waitFor({ timeout: 8000 }).catch(() => {});
+await shot(p, "low-balance-modal", { full: false });
 
-// 4) Support panel: list + customer detail with a goodwill credit
+// Scale company: spike (early charge) + demo controls drawer with toasts
+await as(p, "scale");
+await shot(p, "dashboard-scale");
+await p.getByRole("button", { name: "Demo controls" }).click();
+await p.getByTestId("demo-drawer").getByRole("button", { name: "Traffic spike" }).click();
+await p.getByTestId("toast").filter({ hasText: "early charge" }).waitFor();
+await p.waitForTimeout(600);
+await shot(p, "demo-controls", { full: false, toasts: true });
+await p.keyboard.press("Escape");
+await p.goto("/billing"); await dismissModal(p); await shot(p, "billing-scale");
+
+// Enterprise prospect
+await as(p, "enterprise"); await shot(p, "enterprise");
+
+// Support panel
 const adm = await ctx(); const a = await adm.newPage();
 await a.goto("/admin"); await a.getByLabel("Support password").fill(ADMIN); await a.getByRole("button", { name: "Sign in" }).click();
-await a.getByRole("link", { name: "Maya Chen" }).waitFor(); await shot(a, "admin");
-await a.getByRole("link", { name: "Maya Chen" }).click(); await a.getByRole("heading", { name: "Support actions" }).waitFor();
+await a.getByRole("link", { name: "Hana Sato" }).waitFor(); await shot(a, "admin");
+await a.getByRole("link", { name: "Hana Sato" }).click(); await a.getByRole("heading", { name: "Support actions" }).waitFor();
 await a.getByLabel("Amount (€)").fill("5"); await a.getByLabel("Reason").fill("API outage on 9/24");
 await a.getByRole("button", { name: "Grant credit" }).click(); await a.getByRole("status").filter({ hasText: "granted" }).waitFor();
 await shot(a, "admin-customer");
+
+// Leave the demo ready to present: fresh data, signed out.
+await control(p, { action: "reset", persona: "pro" });
 await browser.close();

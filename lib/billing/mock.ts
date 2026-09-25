@@ -14,7 +14,7 @@ import type { InvoiceLineView, UpcomingInvoicePreview } from "./metronome-types"
 import type { Account, Alert, BillingProvider, RejectReason, CreditGrant, DailyUsage, Invoice, InvoiceLine, UsageRequest } from "./types";
 
 const id = (p: string) => `${p}_${Math.random().toString(36).slice(2, 10)}`;
-const nowIso = () => new Date().toISOString();
+import { nowDate, nowIso, nowMs } from "../clock";
 export const round = (n: number) => Math.round(n * 10000) / 10000;
 const addMonths = (iso: string, m: number) => { const d = new Date(iso); d.setUTCMonth(d.getUTCMonth() + m); return d.toISOString(); };
 const addDays = (iso: string, n: number) => { const d = new Date(iso); d.setUTCDate(d.getUTCDate() + n); return d.toISOString(); };
@@ -23,14 +23,14 @@ const fmtDay = (iso: string) => new Date(iso).toLocaleDateString("en-US", { mont
 export const balance = (a: Pick<Account, "credits">) => round(a.credits.reduce((s, c) => s + c.remaining, 0));
 
 /** Periodo de facturación = mes natural en UTC. */
-export function monthBounds(d = new Date()) {
+export function monthBounds(d = nowDate()) {
   const start = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), 1));
   const end = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 1, 1));
   return { start, end };
 }
 
 /** Fracción del periodo que queda por consumir (para el prorrateo). */
-export function remainingRatio(a: Pick<Account, "periodStart" | "periodEnd">, at = Date.now()) {
+export function remainingRatio(a: Pick<Account, "periodStart" | "periodEnd">, at = nowMs()) {
   const start = +new Date(a.periodStart), end = +new Date(a.periodEnd);
   return Math.min(1, Math.max(0, (end - at) / (end - start)));
 }
@@ -133,7 +133,7 @@ function addDaily(a: Account, ts: string, metric: MetricId, quantity: number, co
 }
 
 /** Cierre de periodo(s): factura el exceso, caducan créditos del plan, se aplica la bajada programada y se cobra la nueva cuota. */
-export function closePeriods(a: Account, at = Date.now()): boolean {
+export function closePeriods(a: Account, at = nowMs()): boolean {
   let changed = false;
   // Caducidad de promos/commits a mitad de periodo
   for (const c of a.credits) if (c.expiresAt && +new Date(c.expiresAt) <= at && c.remaining > 0 && c.kind !== "recurring") { c.remaining = 0; changed = true; }
@@ -228,7 +228,7 @@ export function upcomingInvoice(a: Account): UpcomingInvoicePreview {
 }
 
 /** Añade las vistas calculadas (próxima factura, uso 30 días, recomendación de plan). */
-export function withInsights(a: Account, at = new Date()): Account {
+export function withInsights(a: Account, at = nowDate()): Account {
   const usage30 = usageLast30DaysFromDaily(a.customerId, a.daily ?? [], at);
   return { ...a, upcoming: a.upcoming ?? upcomingInvoice(a), usage30, recommendation: recommendPlan(usage30, a.plan) };
 }

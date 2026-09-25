@@ -35,7 +35,7 @@ function List({ logout }: { logout: () => void }) {
         <div className="card"><div className="label">Total balance</div><div className="stat">{eur(rows?.reduce((s, r) => s + r.balance, 0) ?? 0)}</div></div>
         <div className="card"><div className="label">Spend this period</div><div className="stat">{eur(rows?.reduce((s, r) => s + r.spent, 0) ?? 0)}</div></div>
       </div>
-      <section className="card" aria-labelledby="cust-title">
+      <section className="card" aria-labelledby="cust-title" data-tour="admin">
         <form className="formrow" role="search" onSubmit={e => { e.preventDefault(); load(q); }}>
           <div><label className="f" htmlFor="q" id="cust-title">Search customers (name, email or id)</label><input id="q" type="search" value={q} onChange={e => setQ(e.target.value)} placeholder="e.g. lucia@" /></div>
           <button className="btn">Search</button>

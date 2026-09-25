@@ -38,7 +38,7 @@ function SignupForm() {
   return (
     <main className="wrap" style={{ maxWidth: 560 }}>
       <div className="row"><h2 className="sp">Create your account</h2><ModeBadge /></div>
-      <form className="card" onSubmit={submit}>
+      <form className="card" onSubmit={submit} data-tour="signup">
         <label className="f" htmlFor="name">Name</label><input id="name" value={name} onChange={e => setName(e.target.value)} required />
         <label className="f" htmlFor="email">Email</label><input id="email" type="email" value={email} onChange={e => setEmail(e.target.value)} required />
         <label className="f" htmlFor="plan">Plan</label>

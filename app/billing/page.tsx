@@ -28,7 +28,7 @@ function Billing({ a }: { a: AccountView }) {
   const fmtDay = (iso: string) => new Date(iso).toLocaleDateString("en-US", { day: "numeric", month: "long", timeZone: "UTC" });
   const cur = PLANS[a.plan];
   const start = +new Date(a.periodStart), end = +new Date(a.periodEnd);
-  const ratio = Math.max(0, (end - Date.now()) / (end - start));
+  const ratio = Math.max(0, (end - (a.now ? +new Date(a.now) : Date.now())) / (end - start));
 
   return (
     <main className="wrap">
@@ -40,7 +40,7 @@ function Billing({ a }: { a: AccountView }) {
 
       {a.plan === "scale" && <SpendThresholdNotice a={a} />}
       <h3>Your plan</h3>
-      <div className="grid g3">
+      <div className="grid g3" data-tour="upgrade">
         {Object.values(PLANS).map(p => {
           const isCur = p.id === a.plan;
           const isPending = a.pendingPlan?.plan === p.id;
@@ -65,7 +65,7 @@ function Billing({ a }: { a: AccountView }) {
       <div className="sec"><SpendCapForm a={a} /></div>
 
       <div className="grid g2 sec">
-        <div className="card">
+        <div className="card" data-tour="bundle">
           <h3>Buy balance</h3>
           <p className="muted" style={{ fontSize: 14 }}>Charged right away to your saved card. The balance is released once Stripe confirms the payment and the gift is added right after. Valid for 12 months.</p>
           {Object.values(BUNDLES).map(b => (
@@ -84,7 +84,7 @@ function Billing({ a }: { a: AccountView }) {
               <button className="btn small" aria-label={a.spendThreshold?.enabled ? "Turn off early threshold charge" : "Turn on early threshold charge"} disabled={!!busy || (!a.spendThreshold?.enabled && a.autoRecharge)} onClick={() => run("st", "/api/spend-threshold", { enabled: !a.spendThreshold?.enabled })}>{a.spendThreshold?.enabled ? "Turn off" : "Turn on"}</button>
             </div>
           )}
-          <form className="sec" onSubmit={async e => { e.preventDefault(); if (await run("promo", "/api/promo", { code }, `Code ${code.trim().toUpperCase()} redeemed.`)) setCode(""); }}>
+          <form className="sec" data-tour="promo" onSubmit={async e => { e.preventDefault(); if (await run("promo", "/api/promo", { code }, `Code ${code.trim().toUpperCase()} redeemed.`)) setCode(""); }}>
             <label className="f" htmlFor="promo"><b>Promo code</b></label>
             <div className="promo">
               <input id="promo" aria-describedby="promo-help" placeholder="e.g. WELCOME10" value={code} onChange={e => setCode(e.target.value)} autoComplete="off" />
