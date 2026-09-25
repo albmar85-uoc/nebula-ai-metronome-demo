@@ -9,7 +9,7 @@ import type { AccountView } from "@/components/useAccount";
 const STATUS: Record<Invoice["status"], { label: string; cls: string }> = {
   paid: { label: "Pagada", cls: "ok" }, pending: { label: "Pendiente de cobro", cls: "warn" }, draft: { label: "Borrador (se cierra a fin de mes)", cls: "" }, void: { label: "Anulada", cls: "bad" },
 };
-const TYPE: Record<NonNullable<Invoice["type"]>, string> = { subscription: "Suscripción", commit: "Compra de saldo", usage: "Uso", proration: "Prorrateo por cambio de plan" };
+const TYPE: Record<NonNullable<Invoice["type"]>, string> = { subscription: "Suscripción", commit: "Compra de saldo", usage: "Uso", proration: "Prorrateo por cambio de plan", threshold: "Cobro anticipado por umbral" };
 const d = (s?: string, utc = false) => (s ? new Date(s).toLocaleDateString("es-ES", { day: "numeric", month: "long", year: "numeric", ...(utc ? { timeZone: "UTC" } : {}) }) : "—");
 const qty = (n?: number) => (n === undefined ? "" : new Intl.NumberFormat("es-ES", { maximumFractionDigits: 2 }).format(n));
 const unit = (n?: number) => (n === undefined ? "" : n !== 0 && Math.abs(n) < 0.01 ? `${new Intl.NumberFormat("es-ES", { maximumSignificantDigits: 3 }).format(n * 1_000_000)} € / M` : eur(n));

@@ -20,7 +20,7 @@ export default function LowBalanceModal({ a }: { a: AccountView }) {
   const close = () => { localStorage.setItem(KEY, trigger.id); setDismissed(trigger.id); };
   async function buy(b: BundleId) {
     setBusy(b); setErr("");
-    try { await api("/api/bundles/buy", { bundle: b }); close(); } catch (e) { setErr((e as Error).message); } finally { setBusy(""); }
+    try { await api("/api/bundles/buy", { bundle: b, purchaseId: `pur_${crypto.randomUUID()}` }); close(); } catch (e) { setErr((e as Error).message); } finally { setBusy(""); }
   }
   const zero = trigger.type === "zero_balance";
   return (

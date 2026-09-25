@@ -22,7 +22,8 @@ export async function GET(req: Request) {
   if (pm) await stripe().customers.update(customerId, { invoice_settings: { default_payment_method: pm } });
   const { name, email, plan } = s.metadata ?? {};
   if (!name || !email || !plan || !(plan in PLANS)) return NextResponse.redirect(new URL("/signup?error=datos", url));
-  // TODO: idempotencia si el usuario recarga esta URL (guardar session_id procesados).
+  // Idempotente: el id de usuario se deriva del cliente de Stripe (appUserIdFor) y el alta busca por ingest alias;
+  // si el usuario recarga esta URL, se reutiliza el cliente/contrato ya creados.
   const a = await billing.signup({ name, email, plan: plan as PlanId, stripeCustomerId: customerId });
   const res = NextResponse.redirect(new URL("/dashboard", url));
   res.cookies.set(COOKIE, a.customerId, COOKIE_OPTS);

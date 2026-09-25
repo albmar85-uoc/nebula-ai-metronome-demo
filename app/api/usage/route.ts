@@ -1,22 +1,26 @@
+import { randomUUID } from "node:crypto";
 import { billing } from "@/lib/billing";
 import { withCustomer } from "@/lib/route";
-import type { MetricId } from "@/lib/catalog";
+import type { UsageRequest } from "@/lib/billing/types";
 
-// Recibe eventos de uso. Con {simulate:true} genera una petición de IA falsa (generador de la demo).
+// Ingesta de uso: una entrada por petición de IA con su id (→ transaction_id en /v1/ingest; los reintentos se deduplican).
+//   { requests: [{ requestId, inputTokens, outputTokens, images, model?, ts? }] }
+// Con { simulate: true, requestId } genera una petición de IA falsa (generador de la demo).
 export async function POST(req: Request) {
   const body = await req.json();
-  let events: { metric: MetricId; quantity: number }[] = body.events ?? [];
+  let requests: UsageRequest[] = Array.isArray(body.requests) ? body.requests : [];
   if (body.simulate) {
     const scale = body.intensity ?? 1;
     const r = (min: number, max: number) => Math.round((min + Math.random() * (max - min)) * scale);
-    events = [
-      { metric: "input_tokens", quantity: r(20_000, 400_000) },
-      { metric: "output_tokens", quantity: r(10_000, 250_000) },
-    ];
-    if (Math.random() < 0.5) events.push({ metric: "images", quantity: Math.max(1, r(1, 12)) });
+    const withImages = Math.random() < 0.35;
+    requests = [{
+      requestId: typeof body.requestId === "string" ? body.requestId : `req_${randomUUID()}`,
+      ...(withImages ? { images: Math.max(1, r(1, 12)), model: "nebula-image-1" } : { inputTokens: r(20_000, 400_000), outputTokens: r(10_000, 250_000), model: "nebula-1" }),
+    }];
   }
+  requests = requests.filter(x => x && typeof x.requestId === "string" && x.requestId.length <= 128);
   return withCustomer(async cid => {
-    const r = await billing.ingest(cid, events);
-    return { account: r.account, rejected: r.rejected };
+    const r = await billing.ingest(cid, requests);
+    return { account: r.account, rejected: r.rejected, duplicates: r.duplicates };
   });
 }

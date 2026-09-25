@@ -1,14 +1,20 @@
 "use client";
 import { useEffect, useRef, useState } from "react";
+import Link from "next/link";
 import Guard from "@/components/Guard";
 import Banners from "@/components/Banners";
 import ModeBadge from "@/components/ModeBadge";
 import UsageChart from "@/components/UsageChart";
 import LowBalanceModal from "@/components/LowBalanceModal";
+import UpcomingInvoice from "@/components/UpcomingInvoice";
+import SpendThresholdNotice from "@/components/SpendThresholdNotice";
 import { api, type AccountView } from "@/components/useAccount";
 import { METRICS, PLANS, eur, type MetricId } from "@/lib/catalog";
 
 const fmt = (n: number) => new Intl.NumberFormat("es-ES").format(n);
+const KIND = {
+  recurring: { label: "crédito del plan", cls: "" }, promo: { label: "promoción", cls: "warn" }, gift: { label: "regalo", cls: "ok" }, commit: { label: "saldo pagado", cls: "acc" },
+} as const;
 
 function Dashboard({ a }: { a: AccountView }) {
   const [running, setRunning] = useState(false);
@@ -17,7 +23,8 @@ function Dashboard({ a }: { a: AccountView }) {
   const timer = useRef<ReturnType<typeof setInterval> | null>(null);
 
   async function tick() {
-    const r = await api("/api/usage", { simulate: true, intensity });
+    // Cada petición lleva su id (→ transaction_id en Metronome): si se reintenta, no se cobra dos veces.
+    const r = await api("/api/usage", { simulate: true, intensity, requestId: `req_${crypto.randomUUID()}` });
     if (r.rejected) { setMsg("Petición rechazada: saldo agotado."); stop(); } else setMsg("");
   }
   function start() { setRunning(true); timer.current = setInterval(() => tick().catch(() => stop()), 900); }
@@ -35,6 +42,7 @@ function Dashboard({ a }: { a: AccountView }) {
   const recent = [...a.usage].slice(0, 40).reverse();
   const max = Math.max(...recent.map(u => u.cost), 0.0001);
   const plan = PLANS[a.plan];
+  const rec = a.recommendation;
 
   return (
     <main className="wrap">
@@ -43,15 +51,26 @@ function Dashboard({ a }: { a: AccountView }) {
       <LowBalanceModal a={a} />
       <div className="grid g4">
         <div className="card"><div className="label">Saldo disponible</div><div className="stat">{eur(a.balance)}</div><div className="bar" style={{ marginTop: 10 }}><i style={{ width: `${Math.min(100, (a.balance / Math.max(granted, 1)) * 100)}%` }} /></div></div>
-        <div className="card"><div className="label">Gastado este mes</div><div className="stat">{eur(spent)}</div><div className="muted" style={{ fontSize: 13 }}>{a.usage.length} peticiones{a.mode === "metronome" && " · estimado"}</div></div>
+        <div className="card"><div className="label">Gastado este mes</div><div className="stat">{eur(spent)}</div><div className="muted" style={{ fontSize: 13 }}>{new Set(a.usage.filter(u => u.ts >= a.periodStart).map(u => u.requestId ?? u.id)).size} peticiones recientes{a.mode === "metronome" && " · estimado"}</div></div>
         <div className="card"><div className="label">Plan</div><div className="stat">{plan.name}</div><div className="muted" style={{ fontSize: 13 }}>{plan.discount ? `${plan.discount * 100} % de descuento` : "Sin descuento"}</div></div>
-        <div className="card"><div className="label">Uso extra (fin de mes)</div><div className="stat">{eur(a.overageAccrued)}</div><div className="muted" style={{ fontSize: 13 }}>{plan.overage ? "Se factura al cierre" : "No disponible en tu plan"}</div></div>
+        <div className="card"><div className="label">Uso extra (fin de mes)</div><div className="stat">{eur(Math.max(0, a.overageAccrued - (a.spendPrepaid ?? 0)))}</div><div className="muted" style={{ fontSize: 13 }}>{plan.overage ? "Se factura al cierre" : "No disponible en tu plan"}</div></div>
       </div>
 
-      <div className="card sec">
-        <h3>Histórico de uso</h3>
-        <p className="muted" style={{ fontSize: 13, marginTop: 0 }}>Por día y métrica. {a.mode === "metronome" ? "Coste estimado con la tarifa; el importe facturado sale de Metronome." : "Coste ya con el descuento de tu plan."}</p>
-        <UsageChart daily={daily} />
+      {a.plan === "scale" && <div className="sec"><SpendThresholdNotice a={a} compact /></div>}
+
+      <div className="grid g2x sec">
+        <div className="card">
+          <h3>Uso de los últimos 30 días</h3>
+          <p className="muted" style={{ fontSize: 13, marginTop: 0 }}>Por día y métrica. {a.mode === "metronome" ? "Cantidades de Metronome (/v1/usage); coste estimado con tu tarifa." : "Coste ya con el descuento de tu plan."}</p>
+          <UsageChart usage30={a.usage30} daily={daily} />
+          {rec && rec.recommended !== a.plan && (rec.savingsVsCurrentEur ?? 0) > 1 && (
+            <div className="banner info" style={{ marginTop: 14, marginBottom: 0 }}>
+              Con tu uso de los últimos 30 días, el plan <b>{PLANS[rec.recommended].name}</b> te saldría por unos {eur(rec.estimates.find(e => e.plan === rec.recommended)!.totalMonthlyEur)}/mes
+              (ahorro estimado: {eur(rec.savingsVsCurrentEur!)}/mes). <Link href="/billing"><u>Cambiar de plan</u></Link>
+            </div>
+          )}
+        </div>
+        <UpcomingInvoice a={a} />
       </div>
 
       <div className="grid g2 sec">
@@ -89,9 +108,9 @@ function Dashboard({ a }: { a: AccountView }) {
         </div>
         <div className="card">
           <h3>Desglose del saldo</h3>
-          <p className="muted" style={{ fontSize: 13, marginTop: 0 }}>Se consume en este orden: créditos mensuales → regalo → commits prepagados.</p>
+          <p className="muted" style={{ fontSize: 13, marginTop: 0 }}>Se consume en este orden: créditos del plan → promociones → regalos → saldo pagado. Dentro de cada tipo, primero lo que caduca antes.</p>
           <div className="tablewrap"><table><thead><tr><th>Origen</th><th>Restante</th></tr></thead>
-            <tbody>{a.credits.map(c => <tr key={c.id}><td>{c.label} <span className={`badge ${c.kind === "gift" ? "ok" : c.kind === "commit" ? "acc" : ""}`}>{c.kind === "recurring" ? "crédito mensual" : c.kind === "commit" ? "commit" : "regalo"}</span></td><td>{eur(c.remaining)} / {eur(c.amount)}</td></tr>)}</tbody></table></div>
+            <tbody>{a.credits.filter(c => c.remaining > 0 || c.kind === "recurring").map(c => <tr key={c.id}><td>{c.label} <span className={`badge ${KIND[c.kind].cls}`}>{KIND[c.kind].label}</span>{c.expiresAt && <div className="muted" style={{ fontSize: 12 }}>caduca el {new Date(c.expiresAt).toLocaleDateString("es-ES", { timeZone: "UTC" })}</div>}</td><td style={{ whiteSpace: "nowrap" }}>{eur(c.remaining)} / {eur(c.amount)}</td></tr>)}</tbody></table></div>
         </div>
       </div>
     </main>

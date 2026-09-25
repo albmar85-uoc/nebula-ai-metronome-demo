@@ -1,12 +1,16 @@
 import type { BundleId, MetricId, PlanId } from "../catalog";
+import type { SpendThresholdState, UpcomingInvoicePreview, UsageLast30Days, PlanRecommendation } from "./metronome-types";
 
 export type CreditGrant = {
   id: string;
-  kind: "recurring" | "commit" | "gift"; // crédito mensual, commit prepagado, saldo de regalo
+  // crédito mensual, promo con caducidad, saldo de regalo del bundle, commit prepagado (bundle / recarga / umbral)
+  kind: "recurring" | "promo" | "gift" | "commit";
   label: string;
   amount: number;
   remaining: number;
   createdAt: string;
+  expiresAt?: string;
+  reference?: string; // purchaseId del bundle o código promocional
 };
 
 export type InvoiceLine = { description: string; quantity?: number; unitPrice?: number; amount: number; kind?: "fee" | "usage" | "commit" | "credit" | "discount" };
@@ -16,15 +20,15 @@ export type Invoice = {
   description: string;
   amount: number;
   status: "paid" | "pending" | "draft" | "void";
-  type?: "subscription" | "commit" | "usage" | "proration";
+  type?: "subscription" | "commit" | "usage" | "proration" | "threshold";
   periodStart?: string;
   periodEnd?: string;
   lines?: InvoiceLine[];
   externalId?: string; // p. ej. id de la factura o PaymentIntent en Stripe
   pdfUrl?: string;
 };
-export type UsageEvent = { id: string; ts: string; metric: MetricId; quantity: number; cost: number };
-export type DailyUsage = { day: string; metric: MetricId; quantity: number; cost: number }; // day = AAAA-MM-DD
+export type UsageEvent = { id: string; requestId?: string; ts: string; metric: MetricId; quantity: number; cost: number };
+export type DailyUsage = { day: string; metric: MetricId; quantity: number; cost: number }; // day = AAAA-MM-DD (UTC)
 export type Alert = { id: string; ts: string; type: "low_balance" | "zero_balance" | "auto_recharge" | "payment" | "info"; message: string; source?: "local" | "webhook"; verified?: boolean };
 
 export type Account = {
@@ -32,31 +36,44 @@ export type Account = {
   name: string;
   email: string;
   plan: PlanId;
-  pendingPlan?: { plan: PlanId; effectiveAt: string }; // bajadas de plan programadas
+  pendingPlan?: { plan: PlanId; effectiveAt: string }; // bajadas de plan programadas al siguiente periodo
   cardSaved: boolean;
   autoRecharge: boolean;
+  spendThreshold?: SpendThresholdState; // solo Scale
   blocked: boolean;
+  accessCut?: boolean; // corte por webhook de saldo 0 (Free/Pro) o pago de umbral fallido
   overageAccrued: number;
+  spendPrepaid?: number; // cobrado por adelantado por el spend threshold en el periodo actual
   credits: CreditGrant[];
   usage: UsageEvent[];
   daily?: DailyUsage[];
+  seenRequests?: string[]; // ids de petición ya contabilizados (idempotencia, como transaction_id en Metronome)
+  redeemedPromos?: string[];
   invoices: Invoice[];
   alerts: Alert[];
   periodStart: string;
   periodEnd: string;
   mode: "mock" | "metronome";
+  // Vistas calculadas (formas de metronome-types.ts)
+  upcoming?: UpcomingInvoicePreview;
+  usage30?: UsageLast30Days;
+  recommendation?: PlanRecommendation;
 };
 
 export type SignupInput = { name: string; email: string; plan: PlanId; stripeCustomerId?: string };
-export type IngestEvent = { metric: MetricId; quantity: number; ts?: string };
+/** Una petición de IA de la app. requestId es el id de la petición y se usa como transaction_id en /v1/ingest. */
+export type UsageRequest = { requestId: string; inputTokens?: number; outputTokens?: number; images?: number; model?: string; ts?: string };
 
 export interface BillingProvider {
   mode: "mock" | "metronome";
   signup(input: SignupInput): Promise<Account>;
   get(customerId: string): Promise<Account | null>;
   changePlan(customerId: string, plan: PlanId): Promise<Account>;
-  buyBundle(customerId: string, bundle: BundleId): Promise<Account>;
+  /** purchaseId: id de compra de la app (idempotencia y correlación del regalo). */
+  buyBundle(customerId: string, bundle: BundleId, purchaseId: string): Promise<Account>;
   setAutoRecharge(customerId: string, enabled: boolean): Promise<Account>;
-  ingest(customerId: string, events: IngestEvent[]): Promise<{ account: Account; rejected: boolean }>;
-  getInvoice?(customerId: string, invoiceId: string): Promise<Invoice | null>;
+  setSpendThreshold(customerId: string, enabled: boolean): Promise<Account>;
+  redeemPromo(customerId: string, code: string): Promise<Account>;
+  ingest(customerId: string, requests: UsageRequest[]): Promise<{ account: Account; rejected: boolean; duplicates: number }>;
+  getInvoice(customerId: string, invoiceId: string): Promise<Invoice | null>;
 }
