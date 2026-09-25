@@ -1,12 +1,16 @@
 // Verificación y procesado de webhooks de Metronome.
 // Firma (https://docs.metronome.com/guides/platform-configuration/setup-webhooks#verify-signatures):
 //   HMAC_SHA256(secret, X-Metronome-Date + "\n" + cuerpo_en_bruto) en hexadecimal == Metronome-Webhook-Signature
-//   Metronome envía también "Date" con el mismo valor; se prefiere X-Metronome-Date (los proxies pueden reescribir Date).
-//   Se deben ignorar notificaciones de más de 5 minutos (y deduplicar por id).
+//   Se prefiere X-Metronome-Date (los proxies pueden reescribir Date). Ignorar > 5 min; deduplicar por id (persistido).
+// Interpretación: interpretWebhook (port del helper del setup) → acción de negocio → efectos en la cuenta simulada
+// o en el enlace del cliente real.
 import { createHmac, timingSafeEqual } from "node:crypto";
 import { eur } from "./catalog";
-import { addAlert, findLinkByMetronomeId, getAccount, markWebhookSeen } from "./store";
+import { addAlert, findLinkByMetronomeId, getAccount, isWebhookSeen, markWebhookSeen } from "./store";
 import type { Alert } from "./billing/types";
+import type { MetronomeWebhookEvent } from "./billing/metronome-types";
+import { interpretWebhook } from "./billing/metronome-helpers";
+import { confirmBundlePaymentsMock, setAccessCutMock } from "./billing/mock";
 
 type HeaderGetter = { get(name: string): string | null };
 
@@ -29,50 +33,71 @@ export function verifyMetronomeSignature(rawBody: string, headers: HeaderGetter,
   return { ok: true };
 }
 
-export type MetronomeEvent = { id: string; type: string; properties?: Record<string, unknown>; [k: string]: unknown };
+export type MetronomeEvent = MetronomeWebhookEvent;
 
-/** Dónde guardar la alerta: cuenta simulada (id local) o id de cliente de Metronome (modo en vivo). */
-function alertKey(customerId: string | undefined): string | null {
+/** A qué cliente pertenece: cuenta simulada (id local) o cliente real (id de Metronome enlazado). */
+function target(customerId: string | undefined): { kind: "mock" | "live"; key: string } | null {
   if (!customerId) return null;
-  if (getAccount(customerId)) return customerId;
-  if (findLinkByMetronomeId(customerId)) return customerId;
+  if (getAccount(customerId)) return { kind: "mock", key: customerId };
+  if (findLinkByMetronomeId(customerId)) return { kind: "live", key: customerId };
   return null;
 }
 
-export async function handleMetronomeEvent(ev: MetronomeEvent, opts: { verified: boolean; onPaymentPaid?: (contractId: string) => Promise<unknown> }) {
-  if (!ev?.id || !ev?.type) return { status: "ignored", reason: "evento sin id/type" } as const;
-  if (!markWebhookSeen(ev.id)) return { status: "duplicate" } as const;
-  const p = ev.properties ?? {};
-  const key = alertKey(p.customer_id as string | undefined);
-  const push = (type: Alert["type"], message: string) => {
-    if (!key) return false;
-    addAlert(key, { id: `wh_${ev.id}`, ts: (p.timestamp as string) ?? new Date().toISOString(), type, message, source: "webhook", verified: opts.verified });
-    return true;
-  };
+type Result = { status: "stored" | "duplicate" | "ignored" | "unknown_customer"; action?: string; reason?: string; purchases?: string[] };
 
-  if (ev.type.startsWith("alerts.")) {
-    // p. ej. alerts.low_remaining_contract_credit_and_commit_balance_reached: remaining_balance y threshold en la
-    // unidad del tipo de crédito (EUR = unidades enteras; USD = céntimos → METRONOME_AMOUNT_SCALE=100).
-    const scale = Number(process.env.METRONOME_AMOUNT_SCALE || 1) || 1;
-    const remaining = typeof p.remaining_balance === "number" ? p.remaining_balance / scale : null;
-    const zero = remaining !== null && remaining <= 0;
-    const msg = zero
-      ? "Metronome avisa: saldo agotado."
-      : `Metronome avisa: ${p.alert_name ?? "saldo bajo"}${remaining !== null ? ` (quedan ${eur(remaining)})` : ""}.`;
-    return { status: push(zero ? "zero_balance" : "low_balance", msg) ? "stored" : "unknown_customer" } as const;
+export async function handleMetronomeEvent(ev: MetronomeEvent, opts: { verified: boolean; source?: Alert["source"] }): Promise<Result> {
+  if (!ev?.id || !ev?.type) return { status: "ignored", reason: "evento sin id/type" };
+  if (isWebhookSeen(ev.id)) return { status: "duplicate" };
+  const scale = Number(process.env.METRONOME_AMOUNT_SCALE || 1) || 1;
+  const act = interpretWebhook(ev, scale);
+  if (act.action === "ignore") { markWebhookSeen(ev.id); return { status: "ignored", reason: `tipo no gestionado: ${ev.type}` }; }
+
+  const t = target(act.customerId);
+  if (!t) { markWebhookSeen(ev.id); return { status: "unknown_customer", action: act.action }; }
+  const ts = (ev.properties?.timestamp as string | undefined) ?? new Date().toISOString();
+  const push = (type: Alert["type"], message: string) =>
+    addAlert(t.key, { id: `wh_${ev.id}`, ts, type, message, source: opts.source ?? "webhook", verified: opts.verified });
+  // Carga perezosa del adaptador en vivo (evita cargar el SDK en modo simulado).
+  const live = t.kind === "live" ? await import("./billing/metronome") : null;
+  const setCut = (cut: boolean) => (t.kind === "mock" ? setAccessCutMock(t.key, cut) : live!.setAccessCutLive(t.key, cut));
+  let purchases: string[] | undefined;
+
+  switch (act.action) {
+    case "offer_top_up":
+      push("low_balance", `Metronome avisa: saldo bajo (quedan ${eur(act.remainingEur)}). ¿Quieres recargar?`);
+      break;
+    case "cut_access":
+      // Alerta global de 0 €: la app corta en Free/Pro (Metronome no bloquea el uso). Scale sigue con overage.
+      setCut(true);
+      push("zero_balance", "Metronome avisa: saldo agotado. En Free/Pro el acceso queda en pausa hasta que recargues.");
+      break;
+    case "payment_succeeded":
+      if (act.workflowType === "spend") push("payment", "Cobro anticipado por umbral de gasto confirmado.");
+      else {
+        purchases = t.kind === "mock" ? confirmBundlePaymentsMock(t.key, true) : await live!.confirmBundlePaymentsLive(t.key, true);
+        push("payment", purchases.length ? "Pago confirmado en Stripe: saldo y regalo del bundle disponibles." : "Pago confirmado en Stripe. Saldo liberado.");
+      }
+      setCut(false);
+      break;
+    case "payment_failed":
+      if (act.workflowType === "spend") {
+        // Si falla el cobro de umbral, Metronome desactiva el spend threshold: cortamos y avisamos.
+        setCut(true);
+        push("payment", `El cobro anticipado por umbral ha fallado${act.message ? `: ${act.message}` : ""}. Revisa tu tarjeta.`);
+      } else {
+        purchases = t.kind === "mock" ? confirmBundlePaymentsMock(t.key, false) : await live!.confirmBundlePaymentsLive(t.key, false);
+        push("payment", `El pago ha fallado${act.message ? `: ${act.message}` : ""}. No se ha añadido saldo.`);
+      }
+      break;
+    case "payment_requires_action":
+      push("payment", "El pago necesita una acción adicional (p. ej. 3D Secure) en Stripe.");
+      break;
+    case "threshold_charge_started":
+      push("payment", act.workflowType === "spend"
+        ? "Has alcanzado el umbral de gasto: se ha iniciado un cobro anticipado."
+        : "Tu saldo bajó del umbral: se ha iniciado la recarga automática.");
+      break;
   }
-  if (ev.type === "payment_gate.payment_status") {
-    const paid = p.payment_status === "paid";
-    if (paid && p.workflow_type === "manual_commit" && typeof p.contract_id === "string" && opts.onPaymentPaid) {
-      // TODO(verificar): correlacionar por invoice_id con el commit concreto si hay varias compras a la vez.
-      await opts.onPaymentPaid(p.contract_id);
-    }
-    push("payment", paid ? "Pago confirmado en Stripe. Saldo liberado." : `El pago ha fallado: ${p.error_message ?? "motivo desconocido"}.`);
-    return { status: "stored" } as const;
-  }
-  if (ev.type === "payment_gate.payment_pending_action_required") {
-    push("payment", "El pago necesita una acción adicional (p. ej. 3D Secure).");
-    return { status: "stored" } as const;
-  }
-  return { status: "ignored", reason: `tipo no gestionado: ${ev.type}` } as const;
+  markWebhookSeen(ev.id); // solo tras procesar bien: si algo lanza, el reintento de Metronome lo vuelve a procesar
+  return { status: "stored", action: act.action, purchases };
 }

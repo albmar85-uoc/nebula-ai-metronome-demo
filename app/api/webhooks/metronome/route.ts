@@ -1,10 +1,8 @@
 import { NextResponse } from "next/server";
 import { isLive } from "@/lib/billing";
-import { releasePendingGift } from "@/lib/billing/metronome";
 import { handleMetronomeEvent, verifyMetronomeSignature, type MetronomeEvent } from "@/lib/webhooks";
 
-// Receptor de webhooks de Metronome (alerts.low_remaining_contract_credit_and_commit_balance_reached,
-// payment_gate.payment_status, ...). Verifica la firma con METRONOME_WEBHOOK_SECRET.
+// Receptor de webhooks de Metronome (alertas de saldo, payment_gate.*). Verifica la firma con METRONOME_WEBHOOK_SECRET.
 export const dynamic = "force-dynamic";
 export async function POST(req: Request) {
   const raw = await req.text(); // bytes exactos: la firma se calcula sobre el cuerpo sin re-serializar
@@ -19,6 +17,12 @@ export async function POST(req: Request) {
   }
   let ev: MetronomeEvent;
   try { ev = JSON.parse(raw); } catch { return NextResponse.json({ error: "JSON inválido" }, { status: 400 }); }
-  const r = await handleMetronomeEvent(ev, { verified, onPaymentPaid: isLive() ? releasePendingGift : undefined });
-  return NextResponse.json({ received: true, verified, ...r });
+  try {
+    const r = await handleMetronomeEvent(ev, { verified });
+    return NextResponse.json({ received: true, verified, ...r });
+  } catch (e) {
+    // 5xx ⇒ Metronome reintenta; el evento NO se marcó como visto.
+    console.error("[webhook] error procesando", ev?.id, e);
+    return NextResponse.json({ error: "Error procesando el webhook" }, { status: 500 });
+  }
 }

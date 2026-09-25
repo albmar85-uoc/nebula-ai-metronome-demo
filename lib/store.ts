@@ -13,13 +13,24 @@ export type CustomerLink = {
   email: string;
   plan: PlanId;
   pendingPlan?: { plan: PlanId; effectiveAt: string; contractId: string };
+  accessCut?: boolean; // webhook de saldo 0 (Free/Pro) o pago de umbral fallido; se levanta al confirmarse un pago
+  accessCutAt?: string;
   metronomeCustomerId: string;
   metronomeContractId: string;
   stripeCustomerId?: string;
   createdAt: string;
 };
 
-export type PendingGift = { id: string; contractId: string; bundle: BundleId; createdAt: string };
+/** Compra de bundle: el regalo se concede solo tras payment_gate.payment_status = paid, emparejando por purchaseId. */
+export type Purchase = {
+  purchaseId: string;
+  customerKey: string; // id de cuenta simulada o id de cliente de Metronome
+  contractId: string;
+  bundle: BundleId;
+  status: "payment_pending" | "bonus_granted" | "failed";
+  createdAt: string;
+  resolvedAt?: string;
+};
 
 type DB = {
   version: 1;
@@ -27,11 +38,13 @@ type DB = {
   links: Record<string, CustomerLink>; // modo en vivo: appUserId -> IDs externos
   alerts: Record<string, Alert[]>; // alertas recibidas por webhook, por id de cliente (Metronome o local)
   usage: Record<string, UsageEvent[]>; // modo en vivo: copia local de los eventos enviados (para gráficas)
-  pendingGifts: PendingGift[]; // saldo de regalo pendiente de que Stripe confirme el pago del commit
-  seenWebhooks: { id: string; ts: string }[]; // deduplicación de webhooks
+  purchases: Purchase[]; // compras de bundles (regalo pendiente de confirmación de pago)
+  seenWebhooks: { id: string; ts: string }[]; // deduplicación de webhooks por id (persistida en disco)
+  seenRequests: Record<string, string[]>; // modo en vivo: ids de petición ya enviados a /v1/ingest por usuario
+  enterpriseLeads: { id: string; ts: string; company: string; email: string; monthlySpend: number }[];
 };
 
-const empty = (): DB => ({ version: 1, accounts: {}, links: {}, alerts: {}, usage: {}, pendingGifts: [], seenWebhooks: [] });
+const empty = (): DB => ({ version: 1, accounts: {}, links: {}, alerts: {}, usage: {}, purchases: [], seenWebhooks: [], seenRequests: {}, enterpriseLeads: [] });
 
 const g = globalThis as unknown as { __db?: { file: string; data: DB } };
 
@@ -87,12 +100,34 @@ export function addAlert(customerKey: string, alert: Alert) {
 }
 export const getAlerts = (customerKey: string) => read(db => db.alerts[customerKey] ?? []);
 
-/** Devuelve false si el webhook ya se había procesado. */
+export const addPurchase = (p: Purchase) => tx(db => { if (!db.purchases.some(x => x.purchaseId === p.purchaseId)) db.purchases.push(p); });
+export const getPurchase = (id: string) => read(db => db.purchases.find(p => p.purchaseId === id) ?? null);
+export const pendingPurchases = (customerKey: string) => read(db => db.purchases.filter(p => p.customerKey === customerKey && p.status === "payment_pending"));
+export const resolvePurchase = (id: string, status: Purchase["status"]) =>
+  tx(db => { const p = db.purchases.find(x => x.purchaseId === id); if (p) { p.status = status; p.resolvedAt = new Date().toISOString(); } });
+
+/** Deduplicación de webhooks por id, persistida en db.json (sobrevive a reinicios). */
+export const isWebhookSeen = (id: string) => read(db => db.seenWebhooks.some(w => w.id === id));
+/** Devuelve false si el webhook ya se había procesado. Se llama DESPUÉS de procesarlo bien (si falla, el reintento de Metronome vuelve a entrar). */
 export function markWebhookSeen(id: string): boolean {
   return tx(db => {
     if (db.seenWebhooks.some(w => w.id === id)) return false;
     db.seenWebhooks.unshift({ id, ts: new Date().toISOString() });
-    db.seenWebhooks = db.seenWebhooks.slice(0, 500);
+    // Metronome reintenta durante ~2 días: guardamos hasta 5000 ids o 7 días.
+    const cutoff = new Date(Date.now() - 7 * 86400_000).toISOString();
+    db.seenWebhooks = db.seenWebhooks.filter(w => w.ts >= cutoff).slice(0, 5000);
     return true;
   });
 }
+
+/** Modo en vivo: filtra los ids de petición ya enviados (además, /v1/ingest deduplica por transaction_id 34 días). */
+export function claimRequestIds(appUserId: string, ids: string[]): string[] {
+  return tx(db => {
+    const seen = new Set(db.seenRequests[appUserId] ?? []);
+    const fresh = ids.filter(id => !seen.has(id) && (seen.add(id), true));
+    db.seenRequests[appUserId] = [...seen].slice(-5000);
+    return fresh;
+  });
+}
+
+export const addEnterpriseLead = (l: DB["enterpriseLeads"][number]) => tx(db => { db.enterpriseLeads.unshift(l); db.enterpriseLeads = db.enterpriseLeads.slice(0, 200); });
