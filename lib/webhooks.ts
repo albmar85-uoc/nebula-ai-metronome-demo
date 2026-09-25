@@ -21,15 +21,15 @@ export function signMetronome(secret: string, date: string, rawBody: string) {
 export function verifyMetronomeSignature(rawBody: string, headers: HeaderGetter, secret: string, opts: { now?: number; toleranceMs?: number } = {}): { ok: true } | { ok: false; reason: string } {
   const date = headers.get("x-metronome-date") ?? headers.get("date");
   const sig = headers.get("metronome-webhook-signature");
-  if (!date || !sig) return { ok: false, reason: "Faltan las cabeceras X-Metronome-Date/Date o Metronome-Webhook-Signature" };
+  if (!date || !sig) return { ok: false, reason: "Missing X-Metronome-Date/Date or Metronome-Webhook-Signature headers" };
   const ts = new Date(date).valueOf();
-  if (Number.isNaN(ts)) return { ok: false, reason: "Fecha de la cabecera inválida" };
+  if (Number.isNaN(ts)) return { ok: false, reason: "Invalid date header" };
   const tol = opts.toleranceMs ?? 5 * 60 * 1000;
   const now = opts.now ?? Date.now();
-  if (tol > 0 && Math.abs(now - ts) > tol) return { ok: false, reason: "Notificación fuera de la ventana de 5 minutos" };
+  if (tol > 0 && Math.abs(now - ts) > tol) return { ok: false, reason: "Notification outside the 5-minute window" };
   const expected = Buffer.from(signMetronome(secret, date, rawBody));
   const got = Buffer.from(sig.trim());
-  if (expected.length !== got.length || !timingSafeEqual(expected, got)) return { ok: false, reason: "Firma no válida" };
+  if (expected.length !== got.length || !timingSafeEqual(expected, got)) return { ok: false, reason: "Invalid signature" };
   return { ok: true };
 }
 
@@ -46,11 +46,11 @@ function target(customerId: string | undefined): { kind: "mock" | "live"; key: s
 type Result = { status: "stored" | "duplicate" | "ignored" | "unknown_customer"; action?: string; reason?: string; purchases?: string[] };
 
 export async function handleMetronomeEvent(ev: MetronomeEvent, opts: { verified: boolean; source?: Alert["source"] }): Promise<Result> {
-  if (!ev?.id || !ev?.type) return { status: "ignored", reason: "evento sin id/type" };
+  if (!ev?.id || !ev?.type) return { status: "ignored", reason: "event without id/type" };
   if (isWebhookSeen(ev.id)) return { status: "duplicate" };
   const scale = Number(process.env.METRONOME_AMOUNT_SCALE || 1) || 1;
   const act = interpretWebhook(ev, scale);
-  if (act.action === "ignore") { markWebhookSeen(ev.id); return { status: "ignored", reason: `tipo no gestionado: ${ev.type}` }; }
+  if (act.action === "ignore") { markWebhookSeen(ev.id); return { status: "ignored", reason: `unhandled type: ${ev.type}` }; }
 
   const t = target(act.customerId);
   if (!t) { markWebhookSeen(ev.id); return { status: "unknown_customer", action: act.action }; }
@@ -64,18 +64,18 @@ export async function handleMetronomeEvent(ev: MetronomeEvent, opts: { verified:
 
   switch (act.action) {
     case "offer_top_up":
-      push("low_balance", `Metronome avisa: saldo bajo (quedan ${eur(act.remainingEur)}). ¿Quieres recargar?`);
+      push("low_balance", `Metronome alert: low balance (${eur(act.remainingEur)} left). Want to top up?`);
       break;
     case "cut_access":
       // Alerta global de 0 €: la app corta en Free/Pro (Metronome no bloquea el uso). Scale sigue con overage.
       setCut(true);
-      push("zero_balance", "Metronome avisa: saldo agotado. En Free/Pro el acceso queda en pausa hasta que recargues.");
+      push("zero_balance", "Metronome alert: balance used up. On Free/Pro, access is paused until you top up.");
       break;
     case "payment_succeeded":
-      if (act.workflowType === "spend") push("payment", "Cobro anticipado por umbral de gasto confirmado.");
+      if (act.workflowType === "spend") push("payment", "Early spend-threshold charge confirmed.");
       else {
         purchases = t.kind === "mock" ? confirmBundlePaymentsMock(t.key, true) : await live!.confirmBundlePaymentsLive(t.key, true);
-        push("payment", purchases.length ? "Pago confirmado en Stripe: saldo y regalo del bundle disponibles." : "Pago confirmado en Stripe. Saldo liberado.");
+        push("payment", purchases.length ? "Payment confirmed in Stripe: bundle balance and gift available." : "Payment confirmed in Stripe. Balance released.");
       }
       setCut(false);
       break;
@@ -83,19 +83,19 @@ export async function handleMetronomeEvent(ev: MetronomeEvent, opts: { verified:
       if (act.workflowType === "spend") {
         // Si falla el cobro de umbral, Metronome desactiva el spend threshold: cortamos y avisamos.
         setCut(true);
-        push("payment", `El cobro anticipado por umbral ha fallado${act.message ? `: ${act.message}` : ""}. Revisa tu tarjeta.`);
+        push("payment", `The early threshold charge failed${act.message ? `: ${act.message}` : ""}. Please check your card.`);
       } else {
         purchases = t.kind === "mock" ? confirmBundlePaymentsMock(t.key, false) : await live!.confirmBundlePaymentsLive(t.key, false);
-        push("payment", `El pago ha fallado${act.message ? `: ${act.message}` : ""}. No se ha añadido saldo.`);
+        push("payment", `The payment failed${act.message ? `: ${act.message}` : ""}. No balance was added.`);
       }
       break;
     case "payment_requires_action":
-      push("payment", "El pago necesita una acción adicional (p. ej. 3D Secure) en Stripe.");
+      push("payment", "The payment needs an extra step (e.g. 3D Secure) in Stripe.");
       break;
     case "threshold_charge_started":
       push("payment", act.workflowType === "spend"
-        ? "Has alcanzado el umbral de gasto: se ha iniciado un cobro anticipado."
-        : "Tu saldo bajó del umbral: se ha iniciado la recarga automática.");
+        ? "You reached the spend threshold: an early charge has started."
+        : "Your balance dropped below the threshold: auto-recharge has started.");
       break;
   }
   markWebhookSeen(ev.id); // solo tras procesar bien: si algo lanza, el reintento de Metronome lo vuelve a procesar

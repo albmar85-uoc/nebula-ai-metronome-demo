@@ -7,9 +7,9 @@ import { stripe } from "@/lib/stripe";
 // (solo guarda la tarjeta, no cobra). Al volver, /api/stripe/return crea el cliente y el contrato en Metronome.
 export const dynamic = "force-dynamic";
 export async function POST(req: Request) {
-  if (!isStripeLive()) return NextResponse.json({ error: "Stripe Checkout solo está activo en modo en vivo" }, { status: 400 });
+  if (!isStripeLive()) return NextResponse.json({ error: "Stripe Checkout is only enabled in live mode" }, { status: 400 });
   const { name, email, plan } = await req.json();
-  if (!name || !email || !(plan in PLANS)) return NextResponse.json({ error: "Datos incompletos" }, { status: 400 });
+  if (!name || !email || !(plan in PLANS)) return NextResponse.json({ error: "Missing details" }, { status: 400 });
   const origin = process.env.APP_URL || new URL(req.url).origin;
   const customer = await stripe().customers.create({ name, email, metadata: { app: "nebula-demo", plan } });
   const session = await stripe().checkout.sessions.create({
@@ -22,7 +22,7 @@ export async function POST(req: Request) {
     locale: "es",
     metadata: { name, email, plan },
     success_url: `${origin}/api/stripe/return?session_id={CHECKOUT_SESSION_ID}`,
-    cancel_url: `${origin}/signup?plan=${plan}&cancelado=1`,
+    cancel_url: `${origin}/signup?plan=${plan}&cancelled=1`,
   });
   return NextResponse.json({ url: session.url });
 }

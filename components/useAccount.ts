@@ -2,7 +2,7 @@
 import { useCallback, useEffect, useState } from "react";
 import type { Account } from "@/lib/billing/types";
 
-export type AccountView = Account & { balance: number };
+export type AccountView = Account & { balance: number; spent: number; capReached: boolean };
 const listeners = new Set<(a: AccountView | null) => void>();
 let cache: AccountView | null = null;
 const publish = (a: AccountView | null) => { cache = a; listeners.forEach(l => l(a)); };
@@ -28,7 +28,7 @@ export function useAccount() {
   return { account, loading, logout };
 }
 
-export type AppConfig = { mode: "mock" | "metronome"; stripeCheckout: boolean };
+export type AppConfig = { mode: "mock" | "metronome"; stripeCheckout: boolean; promotions?: { code: string; label: string; amountEur: number; validDays: number }[] };
 let cfgCache: AppConfig | null = null;
 let cfgPromise: Promise<AppConfig> | null = null;
 /** Modo de la demo (simulado / en vivo), leído en tiempo de ejecución desde /api/config. */

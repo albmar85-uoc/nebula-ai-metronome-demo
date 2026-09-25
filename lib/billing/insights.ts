@@ -1,5 +1,5 @@
 // Cálculos puros compartidos por los modos simulado y en vivo, con las formas de metronome-types.ts.
-import { ENTERPRISE_EXAMPLE, METRICS, PLANS, type MetricId, type PlanId } from "../catalog";
+import { BUNDLES, ENTERPRISE_EXAMPLE, METRICS, PLANS, type BundleId, type MetricId, type PlanId } from "../catalog";
 import type { EnterpriseContractSummary, EnterpriseContractTerms, MetricUsage, PlanCostEstimate, PlanRecommendation, UsageLast30Days } from "./metronome-types";
 import type { DailyUsage } from "./types";
 
@@ -29,17 +29,79 @@ export function usageLast30DaysFromDaily(customerId: string, daily: DailyUsage[]
   return { customerId, windowStart: start, windowEnd: end, metrics, totalListCostEur: round2(Object.values(metrics).reduce((s, x) => s + x.listCostEur, 0)) };
 }
 
-/** Recomendador puro (misma fórmula que recommendPlan del setup): cuota + max(0, uso con descuento − créditos). */
-export function recommendPlan(usage: UsageLast30Days, currentPlan?: PlanId): PlanRecommendation {
-  const estimates: PlanCostEstimate[] = (Object.keys(PLANS) as PlanId[]).map(k => {
+export type PlanEstimate = PlanCostEstimate & {
+  /** Lo que de verdad pagarías por el extra: overage 1:1 en Scale; en Free/Pro, bundles con regalo (precio/crédito). */
+  extraPaidEur: number;
+  coverage: "incluido" | "bundles" | "overage";
+  bundle?: BundleId;
+  note: string;
+  /** Positivo = más barato que tu plan actual. */
+  savingsVsCurrentEur?: number;
+};
+export type PlanComparison = Omit<PlanRecommendation, "estimates"> & {
+  estimates: PlanEstimate[];
+  currentPlan?: PlanId;
+  /** Días con datos dentro de la ventana (desde el primer día con uso). */
+  observedDays: number;
+  /** true si el uso se ha extrapolado a 30 días (menos de 30 días de datos). */
+  projected: boolean;
+  monthlyListCostEur: number;
+  /** Gasto alto: conviene hablar con ventas (Enterprise con commit anual y precios negociados). */
+  enterpriseHint: boolean;
+};
+
+export const ENTERPRISE_HINT_EUR = 1500;
+const MIN_OBSERVED_DAYS = 7;
+
+/** Bundle más rentable que se gastaría dentro de su validez (12 meses) al ritmo de extra mensual dado. */
+export function bestBundleFor(extraPerMonth: number): BundleId {
+  const fits = (Object.values(BUNDLES) as (typeof BUNDLES)[BundleId][]).filter(b => b.credit <= extraPerMonth * b.validityMonths);
+  const pool = fits.length ? fits : [BUNDLES.b50];
+  return pool.sort((a, b) => a.price / a.credit - b.price / b.credit)[0].id;
+}
+
+/**
+ * Comparador de planes con el uso real de los últimos 30 días (proyectado a un mes si hay menos datos).
+ * Por plan: cuota + coste del extra por encima de los créditos incluidos, con el descuento del plan y la forma real
+ * de pagar ese extra (Scale: overage a fin de mes; Free/Pro: bundles prepagados con su regalo).
+ * Compatible con PlanRecommendation del setup (mismos campos, más detalle).
+ */
+export function recommendPlan(usage: UsageLast30Days, currentPlan?: PlanId): PlanComparison {
+  const days = Object.values(usage.metrics)[0]?.daily.length ?? 30;
+  let first = days;
+  for (const m of Object.values(usage.metrics)) {
+    const i = m.daily.findIndex(d => d.value > 0);
+    if (i >= 0) first = Math.min(first, i);
+  }
+  const observedDays = first >= days ? 0 : days - first;
+  const projected = observedDays > 0 && observedDays < days;
+  const factor = projected ? days / Math.max(MIN_OBSERVED_DAYS, observedDays) : 1;
+  const list = round2(usage.totalListCostEur * factor);
+  const estimates: PlanEstimate[] = (Object.keys(PLANS) as PlanId[]).map(k => {
     const p = PLANS[k];
-    const usageCost = round2(usage.totalListCostEur * (1 - p.discount));
+    const usageCost = round2(list * (1 - p.discount));
     const extra = round2(Math.max(0, usageCost - p.monthlyCredits));
-    return { plan: k, monthlyFeeEur: p.monthlyFee, usageCostAfterDiscountEur: usageCost, includedCreditsEur: p.monthlyCredits, extraEur: extra, totalMonthlyEur: round2(p.monthlyFee + extra) };
+    let extraPaid = extra, coverage: PlanEstimate["coverage"] = "incluido", bundle: BundleId | undefined, note = "Your usage fits within the included credits.";
+    if (extra > 0 && p.overage) { coverage = "overage"; note = "Overage is billed at month end at the discounted price."; }
+    else if (extra > 0) {
+      bundle = bestBundleFor(extra);
+      const b = BUNDLES[bundle];
+      extraPaid = round2(extra * (b.price / b.credit));
+      coverage = "bundles";
+      note = `Overage is covered with €${b.price} bundles (€${b.credit} of balance); without balance, access pauses.`;
+    }
+    return { plan: k, monthlyFeeEur: p.monthlyFee, usageCostAfterDiscountEur: usageCost, includedCreditsEur: p.monthlyCredits, extraEur: extra, extraPaidEur: extraPaid, coverage, bundle, note, totalMonthlyEur: round2(p.monthlyFee + extraPaid) };
   });
-  const best = [...estimates].sort((a, b) => a.totalMonthlyEur - b.totalMonthlyEur || PLANS[a.plan].rank - PLANS[b.plan].rank)[0];
   const cur = currentPlan ? estimates.find(e => e.plan === currentPlan) : undefined;
-  return { basedOn: usage, estimates, recommended: best.plan, savingsVsCurrentEur: cur ? round2(cur.totalMonthlyEur - best.totalMonthlyEur) : undefined };
+  if (cur) for (const e of estimates) e.savingsVsCurrentEur = round2(cur.totalMonthlyEur - e.totalMonthlyEur);
+  const best = observedDays === 0
+    ? estimates.find(e => e.plan === (currentPlan ?? "free"))!
+    : [...estimates].sort((a, b) => a.totalMonthlyEur - b.totalMonthlyEur || PLANS[a.plan].rank - PLANS[b.plan].rank)[0];
+  return {
+    basedOn: usage, estimates, recommended: best.plan, currentPlan,
+    savingsVsCurrentEur: cur ? round2(cur.totalMonthlyEur - best.totalMonthlyEur) : undefined,
+    observedDays, projected, monthlyListCostEur: list, enterpriseHint: best.totalMonthlyEur >= ENTERPRISE_HINT_EUR,
+  };
 }
 
 /** Propuesta Enterprise simulada (lo que devolvería createEnterpriseContract), a partir de EnterpriseContractTerms. */

@@ -5,7 +5,7 @@
 //   Si no hay fichero, se construye el mismo objeto a partir de variables de entorno (ver .env.example).
 import fs from "node:fs";
 import path from "node:path";
-import { AUTO_RECHARGE, BUNDLES, PLANS, SPEND_THRESHOLD, type MetricId, type PlanId } from "../catalog";
+import { AUTO_RECHARGE, BUNDLES, PLANS, PROMOTIONS, SPEND_THRESHOLD, eur, type BundleId, type MetricId, type PlanId } from "../catalog";
 
 export type FixedProductKey = "plan_credits" | "bundle_commit" | "bundle_bonus" | "auto_recharge" | "spend_threshold" | "promo_credit" | "enterprise_commit";
 export type SubscriptionPlanKey = Exclude<PlanId, "free">;
@@ -26,8 +26,10 @@ export type MetronomeIds = {
   spend_threshold: { scale_threshold_eur: number };
   amount_scale: number;
   catalog: {
-    plans: Record<PlanId, { monthly_fee_eur: number; monthly_credits_eur: number; usage_multiplier: number; subscription_product_id?: string }>;
-    bundles: Record<string, { paid_eur: number; bonus_eur: number }>;
+    plans: Record<PlanId, { display_name: string; monthly_fee_eur: number; monthly_credits_eur: number; usage_multiplier: number; subscription_product_id?: string }>;
+    bundles: Record<string, { display_name: string; paid_eur: number; bonus_eur: number }>;
+    /** Códigos promocionales (clave = código en mayúsculas, p. ej. WELCOME10); display_name visible en factura/UI. */
+    promotions: Record<string, { display_name: string; amount_eur: number; valid_days: number }>;
   };
   /** Solo en la web: de dónde se leyó (diagnóstico). */
   _source?: string;
@@ -48,7 +50,7 @@ const FIXED_ENV: Record<FixedProductKey, string> = {
 };
 const METRIC_ENV: Record<MetricId, string> = { input_tokens: "INPUT_TOKENS", output_tokens: "OUTPUT_TOKENS", images: "IMAGES" };
 
-function fromEnv(e: NodeJS.ProcessEnv): MetronomeIds {
+export function fromEnv(e: NodeJS.ProcessEnv): MetronomeIds {
   const m = <T>(f: (k: MetricId) => T) => ({ input_tokens: f("input_tokens"), output_tokens: f("output_tokens"), images: f("images") });
   return {
     generated_at: "", base_url: e.METRONOME_BASE_URL ?? "https://api.metronome.com", dry_run: false,
@@ -67,8 +69,9 @@ function fromEnv(e: NodeJS.ProcessEnv): MetronomeIds {
     spend_threshold: { scale_threshold_eur: SPEND_THRESHOLD.scaleThreshold },
     amount_scale: Number(e.METRONOME_AMOUNT_SCALE ?? 1) || 1,
     catalog: {
-      plans: Object.fromEntries((Object.keys(PLANS) as PlanId[]).map(k => [k, { monthly_fee_eur: PLANS[k].monthlyFee, monthly_credits_eur: PLANS[k].monthlyCredits, usage_multiplier: 1 - PLANS[k].discount }])) as MetronomeIds["catalog"]["plans"],
-      bundles: Object.fromEntries(Object.values(BUNDLES).map(b => [b.id, { paid_eur: b.price, bonus_eur: b.credit - b.price }])),
+      plans: Object.fromEntries((Object.keys(PLANS) as PlanId[]).map(k => [k, { display_name: PLANS[k].name, monthly_fee_eur: PLANS[k].monthlyFee, monthly_credits_eur: PLANS[k].monthlyCredits, usage_multiplier: 1 - PLANS[k].discount }])) as MetronomeIds["catalog"]["plans"],
+      bundles: Object.fromEntries(Object.values(BUNDLES).map(b => [b.id, { display_name: bundleDisplayName(b.id), paid_eur: b.price, bonus_eur: b.credit - b.price }])),
+      promotions: Object.fromEntries(Object.entries(PROMOTIONS).map(([code, p]) => [code, { display_name: p.label, amount_eur: p.amount, valid_days: p.validDays }])),
     },
   };
 }
@@ -117,11 +120,33 @@ export function loadMetronomeIds(): MetronomeIds {
     auto_recharge: { ...env.auto_recharge, ...f.auto_recharge },
     spend_threshold: { ...env.spend_threshold, ...f.spend_threshold },
     amount_scale: Number(f.amount_scale ?? env.amount_scale) || 1,
-    _source: fileIds ? file : "variables de entorno",
+    // Catálogo: el fichero manda (display_name, promociones); el catálogo de la web rellena lo que falte (ficheros antiguos).
+    catalog: {
+      plans: Object.fromEntries((Object.keys(env.catalog.plans) as PlanId[]).map(k => [k, { ...env.catalog.plans[k], ...f.catalog?.plans?.[k] }])) as MetronomeIds["catalog"]["plans"],
+      bundles: Object.fromEntries(Object.keys(env.catalog.bundles).map(k => [k, { ...env.catalog.bundles[k], ...f.catalog?.bundles?.[k] }])),
+      promotions: f.catalog?.promotions && Object.keys(f.catalog.promotions).length ? f.catalog.promotions : env.catalog.promotions,
+    },
+    _source: fileIds ? file : "environment variables",
   };
-  if (ids.dry_run) throw new Error(`${file} es de un dry-run (IDs de ejemplo). Ejecuta el setup real: cd ../metronome-setup && npm run setup`);
+  if (ids.dry_run) throw new Error(`${file} comes from a dry run (sample IDs). Run the real setup: cd ../metronome-setup && npm run setup`);
   const miss = missingIds(ids);
-  if (miss.length) throw new Error(`Falta configuración de Metronome: ${miss.join(", ")} (en ${file} o en variables de entorno)`);
+  if (miss.length) throw new Error(`Missing Metronome configuration: ${miss.join(", ")} (in ${file} or in environment variables)`);
   cache = { key: `${file}:${mtime}`, ids };
   return ids;
 }
+
+/** Nombre visible de un bundle, igual que el setup: "€50 bundle (+€5 bonus)". */
+export function bundleDisplayName(id: BundleId) {
+  const b = BUNDLES[id];
+  return `€${b.price} bundle (+€${b.credit - b.price} bonus)`;
+}
+
+/** Promoción por código según metronome-ids.json (catalog.promotions); undefined si no existe. */
+export function promotionFromIds(ids: MetronomeIds, rawCode: string) {
+  const code = rawCode.trim().toUpperCase();
+  const p = ids.catalog.promotions[code];
+  return p ? { code, label: p.display_name, amount: p.amount_eur, validDays: p.valid_days, display: `${p.display_name} (${eur(p.amount_eur)}, ${p.valid_days} days)` } : undefined;
+}
+
+/** Nombre visible de un plan según metronome-ids.json (catalog.plans[].display_name). */
+export const planDisplayName = (ids: MetronomeIds, plan: PlanId) => ids.catalog.plans[plan]?.display_name || PLANS[plan].name;

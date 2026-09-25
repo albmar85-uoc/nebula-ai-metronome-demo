@@ -5,7 +5,7 @@ import { METRICS, eur, type MetricId } from "@/lib/catalog";
 import type { EnterpriseContractSummary } from "@/lib/billing/metronome-types";
 
 type Proposal = EnterpriseContractSummary & { monthlyEquivalentEur: number; savingsVsListPct: number };
-const unit = (m: MetricId) => (m === "images" ? "imagen" : "millón de tokens");
+const unit = (m: MetricId) => (m === "images" ? "image" : "million tokens");
 const list = (m: MetricId) => METRICS[m].pricePerUnit * (m === "images" ? 1 : 1_000_000);
 
 export default function Enterprise() {
@@ -25,37 +25,37 @@ export default function Enterprise() {
   return (
     <main className="wrap narrow">
       <h2>nebula.ai Enterprise</h2>
-      <p className="muted">Contrato anual con compromiso de gasto y precios negociados. Cuéntanos tu volumen y te preparamos una propuesta.</p>
+      <p className="muted">Annual contract with a spend commitment and negotiated prices. Tell us your volume and we'll prepare a proposal.</p>
       <div className="grid g2">
         <form className="card" onSubmit={submit}>
-          <label className="f" htmlFor="c">Empresa</label>
+          <label className="f" htmlFor="c">Company</label>
           <input id="c" value={f.company} onChange={e => setF({ ...f, company: e.target.value })} required />
-          <label className="f" htmlFor="e">Correo de trabajo</label>
+          <label className="f" htmlFor="e">Work email</label>
           <input id="e" type="email" value={f.email} onChange={e => setF({ ...f, email: e.target.value })} required />
-          <label className="f" htmlFor="s">Gasto mensual estimado: {eur(f.monthlySpend)}</label>
+          <label className="f" htmlFor="s">Estimated monthly spend: {eur(f.monthlySpend)}</label>
           <input id="s" type="range" min={500} max={20000} step={500} value={f.monthlySpend} onChange={e => setF({ ...f, monthlySpend: +e.target.value })} />
-          {err && <div className="banner bad">{err}</div>}
-          <button className="btn primary" style={{ width: "100%", marginTop: 14 }} disabled={busy}>{busy ? "Enviando…" : "Solicitar propuesta"}</button>
-          <p className="muted" style={{ fontSize: 12 }}>Demo: la solicitud se guarda solo en local, no se envía a nadie.</p>
+          <div role="alert">{err && <div className="banner bad">{err}</div>}</div>
+          <button className="btn primary" style={{ width: "100%", marginTop: 14 }} disabled={busy}>{busy ? "Sending…" : "Request a proposal"}</button>
+          <p className="muted" style={{ fontSize: 12 }}>Demo: the request is only stored locally and is not sent to anyone.</p>
         </form>
         <div className="card">
-          <h3>{p ? "Propuesta de ejemplo" : "Cómo funciona"}</h3>
+          <h3>{p ? "Sample proposal" : "How it works"}</h3>
           {!p && <ul className="clean">
-            <li><b>Compromiso anual:</b> te comprometes a un gasto mínimo; el uso lo va consumiendo y al final del año solo se factura la diferencia si no llegas.</li>
-            <li><b>Precios negociados</b> por métrica, por debajo de la tarifa pública.</li>
-            <li><b>Pago a 30 días</b> con factura mensual del uso.</li>
+            <li><b>Annual commitment:</b> you commit to a minimum spend; usage draws it down and at year end only the shortfall is billed if you fall short.</li>
+            <li><b>Negotiated prices</b> per metric, below the public rate card.</li>
+            <li><b>Net 30 payment</b> with a monthly usage invoice.</li>
           </ul>}
           {p && <>
-            <div className="stat">{eur(p.commitAmountEur)} <small className="muted" style={{ fontSize: 14 }}>/ año</small></div>
-            <p className="muted" style={{ fontSize: 13 }}>{p.commitType === "POSTPAID" ? "Gasto mínimo anual (true-up al final)" : "Prepago anual"} · equivale a {eur(p.monthlyEquivalentEur)}/mes · del {new Date(p.startingAt).toLocaleDateString("es-ES")} al {new Date(p.endingBefore).toLocaleDateString("es-ES")}</p>
-            <div className="tablewrap"><table><thead><tr><th>Métrica</th><th>Tarifa pública</th><th>Tu precio</th></tr></thead><tbody>
+            <div className="stat">{eur(p.commitAmountEur)} <small className="muted" style={{ fontSize: 14 }}>/ year</small></div>
+            <p className="muted" style={{ fontSize: 13 }}>{p.commitType === "POSTPAID" ? "Annual minimum spend (true-up at the end)" : "Annual prepayment"} · equivalent to {eur(p.monthlyEquivalentEur)}/month · from {new Date(p.startingAt).toLocaleDateString("en-US")} to {new Date(p.endingBefore).toLocaleDateString("en-US")}</p>
+            <div className="tablewrap" tabIndex={0}><table><thead><tr><th scope="col">Metric</th><th scope="col">Public rate</th><th scope="col">Your price</th></tr></thead><tbody>
               {p.rateOverrides.map(o => <tr key={o.metric}><td>{METRICS[o.metric].name}</td><td className="muted">{eur(list(o.metric))} / {unit(o.metric)}</td><td><b>{eur(o.priceEur)}</b> / {unit(o.metric)}</td></tr>)}
             </tbody></table></div>
-            <p className="muted" style={{ fontSize: 13 }}>Ahorro medio frente a la tarifa: {p.savingsVsListPct} %. Nuestro equipo te contactará para ajustarla.</p>
+            <p className="muted" style={{ fontSize: 13 }}>Average saving vs. the rate card: {p.savingsVsListPct}%. Our team will contact you to fine-tune it.</p>
           </>}
         </div>
       </div>
-      <p className="sec"><Link href="/#precios" className="muted"><u>← Volver a precios</u></Link></p>
+      <p className="sec"><Link href="/#pricing" className="muted"><u>← Back to pricing</u></Link></p>
     </main>
   );
 }

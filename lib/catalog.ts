@@ -4,9 +4,9 @@ export type MetricId = "input_tokens" | "output_tokens" | "images";
 export type PlanId = "free" | "pro" | "scale";
 
 export const METRICS: Record<MetricId, { name: string; unit: string; pricePerUnit: number; display: string }> = {
-  input_tokens: { name: "Tokens de entrada", unit: "tokens", pricePerUnit: 2 / 1_000_000, display: "2 € / millón" },
-  output_tokens: { name: "Tokens de salida", unit: "tokens", pricePerUnit: 8 / 1_000_000, display: "8 € / millón" },
-  images: { name: "Imágenes generadas", unit: "imágenes", pricePerUnit: 0.04, display: "0,04 € / imagen" },
+  input_tokens: { name: "Input tokens", unit: "tokens", pricePerUnit: 2 / 1_000_000, display: "€2 / million" },
+  output_tokens: { name: "Output tokens", unit: "tokens", pricePerUnit: 8 / 1_000_000, display: "€8 / million" },
+  images: { name: "Generated images", unit: "images", pricePerUnit: 0.04, display: "€0.04 / image" },
 };
 
 export type Plan = {
@@ -24,15 +24,15 @@ export type Plan = {
 export const PLANS: Record<PlanId, Plan> = {
   free: {
     id: "free", name: "Free", rank: 0, monthlyFee: 0, monthlyCredits: 5, discount: 0, overage: false, autoRechargeAllowed: false,
-    features: ["5 € de créditos al mes", "Los créditos no se acumulan", "El acceso se corta al agotar el saldo"],
+    features: ["€5 in credits per month", "Credits don't roll over", "Access pauses when your balance runs out"],
   },
   pro: {
     id: "pro", name: "Pro", rank: 1, monthlyFee: 29, monthlyCredits: 30, discount: 0.1, overage: false, autoRechargeAllowed: true,
-    features: ["30 € de créditos al mes", "10 % de descuento en el uso", "Recarga automática opcional"],
+    features: ["€30 in credits per month", "10% off usage", "Optional auto-recharge (top up to €50)"],
   },
   scale: {
     id: "scale", name: "Scale", rank: 2, monthlyFee: 199, monthlyCredits: 250, discount: 0.2, overage: true, autoRechargeAllowed: true,
-    features: ["250 € de créditos al mes", "20 % de descuento en el uso", "El exceso se factura a fin de mes", "Cobro anticipado si hay un pico de gasto"],
+    features: ["€250 in credits per month", "20% off usage", "Overage billed at month end", "Early charge on usage spikes"],
   },
 };
 
@@ -54,11 +54,11 @@ export const PRIORITIES = { planCredits: 1, promo: 3, bundleBonus: 5, bundleComm
 
 /**
  * Códigos promocionales (créditos gratuitos con caducidad). Los valida la web; en vivo se envían a grantPromoCredit
- * con amountEur/validDays explícitos (el setup trae WELCOME y LAUNCH2026 con los mismos importes).
+ * con amountEur/validDays explícitos (mismos códigos que el setup: WELCOME10 y LAUNCH25).
  */
-export const PROMOTIONS: Record<string, { amount: number; validDays: number; label: string; setupCode: string }> = {
-  BIENVENIDA10: { amount: 10, validDays: 30, label: "Bono de bienvenida", setupCode: "WELCOME" },
-  LANZAMIENTO25: { amount: 25, validDays: 60, label: "Campaña de lanzamiento", setupCode: "LAUNCH2026" },
+export const PROMOTIONS: Record<string, { amount: number; validDays: number; label: string }> = {
+  WELCOME10: { amount: 10, validDays: 30, label: "Welcome bonus" },
+  LAUNCH25: { amount: 25, validDays: 60, label: "Launch campaign" },
 };
 
 /** Ejemplo de propuesta Enterprise (se negocia por cliente). Forma: EnterpriseContractTerms del setup. */
@@ -75,4 +75,4 @@ export const ENTERPRISE_EXAMPLE = {
 };
 
 export const eur = (n: number) =>
-  new Intl.NumberFormat("es-ES", { style: "currency", currency: "EUR", minimumFractionDigits: 2, maximumFractionDigits: n !== 0 && Math.abs(n) < 0.1 ? 4 : 2 }).format(n);
+  new Intl.NumberFormat("en-US", { style: "currency", currency: "EUR", minimumFractionDigits: 2, maximumFractionDigits: n !== 0 && Math.abs(n) < 0.1 ? 4 : 2 }).format(n);

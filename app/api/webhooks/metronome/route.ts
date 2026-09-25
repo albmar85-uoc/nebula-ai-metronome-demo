@@ -16,13 +16,13 @@ export async function POST(req: Request) {
     return NextResponse.json({ error: "Falta METRONOME_WEBHOOK_SECRET" }, { status: 503 });
   }
   let ev: MetronomeEvent;
-  try { ev = JSON.parse(raw); } catch { return NextResponse.json({ error: "JSON inválido" }, { status: 400 }); }
+  try { ev = JSON.parse(raw); } catch { return NextResponse.json({ error: "Invalid JSON" }, { status: 400 }); }
   try {
     const r = await handleMetronomeEvent(ev, { verified });
     return NextResponse.json({ received: true, verified, ...r });
   } catch (e) {
     // 5xx ⇒ Metronome reintenta; el evento NO se marcó como visto.
     console.error("[webhook] error procesando", ev?.id, e);
-    return NextResponse.json({ error: "Error procesando el webhook" }, { status: 500 });
+    return NextResponse.json({ error: "Error processing the webhook" }, { status: 500 });
   }
 }

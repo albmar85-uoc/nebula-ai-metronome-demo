@@ -6,9 +6,9 @@ import { view } from "@/lib/serialize";
 
 // Alta en modo simulado (tarjeta simulada). En vivo el alta pasa por /api/stripe/setup-session.
 export async function POST(req: Request) {
-  if (isStripeLive()) return NextResponse.json({ error: "En modo en vivo el alta se hace con Stripe Checkout" }, { status: 400 });
+  if (isStripeLive()) return NextResponse.json({ error: "In live mode, sign-up goes through Stripe Checkout" }, { status: 400 });
   const { name, email, plan } = await req.json();
-  if (!name || !email || !(plan in PLANS)) return NextResponse.json({ error: "Datos incompletos" }, { status: 400 });
+  if (!name || !email || !(plan in PLANS)) return NextResponse.json({ error: "Missing details" }, { status: 400 });
   try {
     const a = await billing.signup({ name, email, plan: plan as PlanId });
     const res = NextResponse.json(view(a));

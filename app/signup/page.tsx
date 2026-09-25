@@ -5,7 +5,7 @@ import { PLANS, eur, type PlanId } from "@/lib/catalog";
 import { api, useConfig } from "@/components/useAccount";
 import ModeBadge from "@/components/ModeBadge";
 
-const ERRORS: Record<string, string> = { stripe: "No se pudo guardar la tarjeta en Stripe. Inténtalo de nuevo.", datos: "Faltan datos del alta. Vuelve a empezar." };
+const ERRORS: Record<string, string> = { stripe: "We couldn't save the card in Stripe. Please try again.", datos: "Sign-up details are missing. Please start again." };
 
 function SignupForm() {
   const sp = useSearchParams();
@@ -17,7 +17,7 @@ function SignupForm() {
   const [email, setEmail] = useState("alberto@example.com");
   const [card, setCard] = useState("4242 4242 4242 4242");
   const [busy, setBusy] = useState(false);
-  const [err, setErr] = useState(ERRORS[sp.get("error") ?? ""] ?? (sp.get("cancelado") ? "Has cancelado el paso de Stripe. No se ha creado la cuenta." : ""));
+  const [err, setErr] = useState(ERRORS[sp.get("error") ?? ""] ?? (sp.get("cancelled") ? "You cancelled the Stripe step. No account was created." : ""));
 
   async function submit(e: React.FormEvent) {
     e.preventDefault(); setBusy(true); setErr("");
@@ -37,25 +37,25 @@ function SignupForm() {
 
   return (
     <main className="wrap" style={{ maxWidth: 560 }}>
-      <div className="row"><h2 className="sp">Crea tu cuenta</h2><ModeBadge /></div>
+      <div className="row"><h2 className="sp">Create your account</h2><ModeBadge /></div>
       <form className="card" onSubmit={submit}>
-        <label className="f" htmlFor="name">Nombre</label><input id="name" value={name} onChange={e => setName(e.target.value)} required />
+        <label className="f" htmlFor="name">Name</label><input id="name" value={name} onChange={e => setName(e.target.value)} required />
         <label className="f" htmlFor="email">Email</label><input id="email" type="email" value={email} onChange={e => setEmail(e.target.value)} required />
         <label className="f" htmlFor="plan">Plan</label>
         <select id="plan" value={plan} onChange={e => setPlan(e.target.value as PlanId)}>
-          {Object.values(PLANS).map(p => <option key={p.id} value={p.id}>{p.name} · {eur(p.monthlyFee)}/mes · {eur(p.monthlyCredits)} en créditos</option>)}
+          {Object.values(PLANS).map(p => <option key={p.id} value={p.id}>{p.name} · {eur(p.monthlyFee)}/month · {eur(p.monthlyCredits)} in credits</option>)}
         </select>
         {live ? (
-          <p className="muted" style={{ fontSize: 13, marginTop: 14 }}>Al continuar irás a Stripe Checkout para guardar tu tarjeta (no se cobra nada en ese paso).</p>
+          <p className="muted" style={{ fontSize: 13, marginTop: 14 }}>Next you'll go to Stripe Checkout to save your card (nothing is charged in that step).</p>
         ) : (
           <>
-            <label className="f" htmlFor="card">Tarjeta (simulada; en vivo se usa Stripe Checkout en modo guardar tarjeta)</label>
+            <label className="f" htmlFor="card">Card (simulated; live mode uses Stripe Checkout in save-card mode)</label>
             <input id="card" value={card} onChange={e => setCard(e.target.value)} inputMode="numeric" autoComplete="off" />
           </>
         )}
-        <p className="muted" style={{ fontSize: 13 }}>Guardamos la tarjeta para que Metronome cobre la cuota, las recargas y el uso extra. {PLANS[plan].monthlyFee > 0 ? `Tras el alta se cobran ${eur(PLANS[plan].monthlyFee)} (prorrateados si no empiezas a principio de mes${live ? "" : "; en la simulación, el mes completo"}).` : "Hoy no se cobra nada."}</p>
+        <p className="muted" style={{ fontSize: 13 }}>We save your card so Metronome can charge the fee, top-ups and overage. {PLANS[plan].monthlyFee > 0 ? `After sign-up we charge ${eur(PLANS[plan].monthlyFee)} (prorated if you don't start at the beginning of the month).` : "Nothing is charged today."}</p>
         {err && <div className="banner bad">{err}</div>}
-        <button className="btn primary" style={{ width: "100%", marginTop: 8 }} disabled={busy || !cfg}>{busy ? (live ? "Abriendo Stripe…" : "Creando cuenta…") : live ? "Continuar a Stripe" : "Crear cuenta"}</button>
+        <button className="btn primary" style={{ width: "100%", marginTop: 8 }} disabled={busy || !cfg}>{busy ? (live ? "Opening Stripe…" : "Creating account…") : live ? "Continue to Stripe" : "Create account"}</button>
       </form>
     </main>
   );

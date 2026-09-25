@@ -3,14 +3,15 @@
 // aquí solo se orquesta: enlace usuario ↔ IDs externos (store), idempotencia con ids de la app y mapeo a la UI.
 import Metronome from "@metronome/sdk";
 import { createHash } from "node:crypto";
-import { METRICS, PLANS, PROMOTIONS, eur, type MetricId, type PlanId } from "../catalog";
-import { addAlert, addPurchase, claimRequestIds, getAlerts, getLink, getPurchase, pendingPurchases, read, resolvePurchase, saveLink, tx, findLinkByMetronomeId, type CustomerLink } from "../store";
+import { METRICS, PLANS, eur, type MetricId, type PlanId } from "../catalog";
+import { addAlert, addPlanEvent, addPurchase, claimRequestIds, getAlerts, getLink, getPurchase, pendingPurchases, read, resolvePurchase, saveLink, tx, findLinkByMetronomeId, type CustomerLink } from "../store";
 import { recommendPlan, usageLast30DaysFromDaily } from "./insights";
-import { loadMetronomeIds } from "./metronome-config";
+import { capAlerts, capMessage, fitsCap, normalizeCap, periodSpend, requestCost } from "./limits";
+import { loadMetronomeIds, planDisplayName, promotionFromIds } from "./metronome-config";
 import * as H from "./metronome-helpers";
 import type { CreditGrantView, InvoiceView } from "./metronome-types";
 import { round, usageCost } from "./mock";
-import type { Account, Alert, BillingProvider, CreditGrant, DailyUsage, Invoice, UsageEvent, UsageRequest } from "./types";
+import type { Account, Alert, BillingProvider, RejectReason, CreditGrant, DailyUsage, Invoice, UsageEvent, UsageRequest } from "./types";
 
 let _client: Metronome | null = null;
 export const client = () =>
@@ -34,7 +35,7 @@ export function mapInvoice(i: InvoiceView): Invoice {
   const kindOf = (t: string) => (t === "usage" ? "usage" : t === "subscription" ? "fee" : t === "applied_commit_or_credit" ? "credit" : t === "commit_purchase" ? "commit" : undefined);
   return {
     id: i.id, date: i.issuedAt ?? i.periodEnd ?? i.periodStart ?? "", amount: i.totalEur, status,
-    description: i.type === "USAGE" ? (status === "draft" ? "Uso del periodo (borrador)" : "Factura de uso") : i.type === "SCHEDULED" ? "Cargo programado (commit/bundle)" : i.type,
+    description: i.type === "USAGE" ? (status === "draft" ? "Usage this period (draft)" : "Usage invoice") : i.type === "SCHEDULED" ? "Scheduled charge (commit/bundle)" : i.type,
     type: i.type === "USAGE" ? "usage" : "commit", periodStart: i.periodStart, periodEnd: i.periodEnd,
     lines: i.lines.map(l => ({ description: l.name, quantity: l.quantity, unitPrice: l.unitPriceEur, amount: l.totalEur, kind: kindOf(l.type) })),
     externalId: i.stripeInvoiceId, pdfUrl: i.pdfUrl,
@@ -70,7 +71,7 @@ export function buildIngestEvents(c: H.Ctx, customer: string, r: UsageRequest): 
 
 function mustLink(appUserId: string): CustomerLink {
   const l = getLink(appUserId);
-  if (!l) throw new Error("Cliente no encontrado");
+  if (!l) throw new Error("Customer not found");
   return l;
 }
 
@@ -83,6 +84,7 @@ async function resolvePending(link: CustomerLink): Promise<CustomerLink> {
   if (!link.pendingPlan || new Date(link.pendingPlan.effectiveAt) > new Date()) return link;
   const next: CustomerLink = { ...link, plan: link.pendingPlan.plan, metronomeContractId: link.pendingPlan.contractId, pendingPlan: undefined };
   saveLink(next);
+  addPlanEvent(link.appUserId, { ts: link.pendingPlan.effectiveAt, kind: "downgrade_applied", from: link.plan, to: next.plan, actor: "system", effectiveAt: link.pendingPlan.effectiveAt, contractId: next.metronomeContractId });
   await H.syncPlanLowBalanceAlert(ctx(), next.metronomeCustomerId, next.plan).catch(e => console.error("[metronome] syncPlanLowBalanceAlert:", e));
   return next;
 }
@@ -117,6 +119,7 @@ async function toAccount(link0: CustomerLink): Promise<Account> {
     autoRecharge: !!summary.autoRecharge?.enabled,
     spendThreshold: summary.spendThreshold,
     blocked: !plan.overage && (bal <= 0 || accessCut),
+    spendCap: link.spendCap,
     accessCut,
     overageAccrued: plan.overage ? Math.max(0, round(usageDue)) : 0,
     credits, usage: usage.slice(0, 500), daily,
@@ -168,7 +171,7 @@ export async function confirmBundlePaymentsLive(metronomeCustomerId: string, pai
 export const metronomeBilling: BillingProvider = {
   mode: "metronome",
   async signup(input) {
-    if (!input.stripeCustomerId) throw new Error("Falta el cliente de Stripe: completa primero Stripe Checkout (modo setup).");
+    if (!input.stripeCustomerId) throw new Error("Missing Stripe customer: complete Stripe Checkout (setup mode) first.");
     const appUserId = appUserIdFor(input.stripeCustomerId);
     const existing = getLink(appUserId);
     if (existing) return toAccount(existing); // retorno de Checkout repetido
@@ -184,8 +187,9 @@ export const metronomeBilling: BillingProvider = {
       createdAt: new Date().toISOString(),
     };
     saveLink(link);
+    addPlanEvent(appUserId, { ts: link.createdAt, kind: "signup", to: input.plan, actor: "customer", contractId });
     await H.syncPlanLowBalanceAlert(c, link.metronomeCustomerId, link.plan).catch(e => console.error("[metronome] alerta 20 %:", e));
-    localAlert(link.metronomeCustomerId, "info", `Cuenta creada en el plan ${PLANS[input.plan].name}. Tarjeta guardada en Stripe.`, `signup_${appUserId}`);
+    localAlert(link.metronomeCustomerId, "info", `Account created on the ${planDisplayName(c.ids, input.plan)} plan. Card saved in Stripe.`, `signup_${appUserId}`);
     return toAccount(link);
   },
   async get(appUserId) {
@@ -196,24 +200,26 @@ export const metronomeBilling: BillingProvider = {
     const link = mustLink(appUserId);
     try { return mapInvoice(await H.getInvoice(ctx(), link.metronomeCustomerId, invoiceId)); } catch { return null; }
   },
-  async changePlan(appUserId, plan) {
+  async changePlan(appUserId, plan, actor = "customer") {
     const link = await resolvePending(mustLink(appUserId));
-    if (!PLANS[plan]) throw new Error("Plan desconocido");
+    if (!PLANS[plan]) throw new Error("Unknown plan");
     if (link.plan === plan && link.pendingPlan) {
       // TODO(verificar): cancelar una bajada programada = archivar el contrato futuro (POST /v1/contracts/archive) y
       // quitar el ending_before del actual. No está en los helpers del setup; pendiente de confirmar con Metronome.
-      throw new Error("Para cancelar una bajada ya programada, contacta con soporte.");
+      throw new Error("To cancel a scheduled downgrade, please contact support.");
     }
     const c = ctx();
     const r = await H.changePlan(c, link.metronomeCustomerId, plan);
     if (r.kind === "upgrade" && r.newContractId) {
       saveLink({ ...link, plan, metronomeContractId: r.newContractId, pendingPlan: undefined, accessCut: false });
+      addPlanEvent(appUserId, { ts: new Date().toISOString(), kind: "upgrade", from: link.plan, to: plan, actor, contractId: r.newContractId });
       // Archiva la alerta del 20 % del plan anterior y crea la del nuevo (evaluate_on_create).
       await H.syncPlanLowBalanceAlert(c, link.metronomeCustomerId, plan).catch(e => console.error("[metronome] alerta 20 %:", e));
-      localAlert(link.metronomeCustomerId, "info", `Plan cambiado a ${PLANS[plan].name}. Tu saldo anterior se conserva.`, `plan_${r.newContractId}`);
+      localAlert(link.metronomeCustomerId, "info", `Plan changed to ${planDisplayName(c.ids, plan)}. Your previous balance carries over.`, `plan_${r.newContractId}`);
     } else if (r.kind === "downgrade" && r.newContractId) {
       saveLink({ ...link, pendingPlan: { plan, effectiveAt: r.effectiveAt, contractId: r.newContractId } });
-      localAlert(link.metronomeCustomerId, "info", `Bajada a ${PLANS[plan].name} programada para el ${new Date(r.effectiveAt).toLocaleDateString("es-ES", { timeZone: "UTC" })}. Conservarás bundles, regalos y promociones.`, `plan_${r.newContractId}`);
+      addPlanEvent(appUserId, { ts: new Date().toISOString(), kind: "downgrade_scheduled", from: link.plan, to: plan, actor, effectiveAt: r.effectiveAt, contractId: r.newContractId });
+      localAlert(link.metronomeCustomerId, "info", `Downgrade to ${PLANS[plan].name} scheduled for ${new Date(r.effectiveAt).toLocaleDateString("en-US", { timeZone: "UTC" })}. You'll keep your bundles, gifts and promos.`, `plan_${r.newContractId}`);
     }
     return toAccount(getLink(appUserId)!);
   },
@@ -239,34 +245,94 @@ export const metronomeBilling: BillingProvider = {
   async redeemPromo(appUserId, rawCode) {
     const link = mustLink(appUserId);
     const code = rawCode.trim().toUpperCase();
-    const promo = PROMOTIONS[code];
-    if (!promo) throw new Error("Código promocional no válido");
+    // Códigos y nombres de metronome-ids.json (catalog.promotions del setup); el catálogo de la web solo rellena huecos.
+    const promo = promotionFromIds(ctx().ids, code);
+    if (!promo) throw new Error("Invalid promo code");
     const r = await H.grantPromoCredit(ctx(), { customerId: link.metronomeCustomerId, contractId: link.metronomeContractId, code, label: promo.label, amountEur: promo.amount, validDays: promo.validDays });
-    localAlert(link.metronomeCustomerId, "info", `Código ${code} canjeado: ${eur(r.amountEur)} de crédito hasta el ${new Date(r.expiresAt).toLocaleDateString("es-ES", { timeZone: "UTC" })}.`, `promo_${code}`);
+    localAlert(link.metronomeCustomerId, "info", `Code ${code} redeemed: ${eur(r.amountEur)} in credit until ${new Date(r.expiresAt).toLocaleDateString("en-US", { timeZone: "UTC" })}.`, `promo_${code}`);
     return toAccount(link);
   },
   async ingest(appUserId, requests) {
     const link = mustLink(appUserId);
     const plan = PLANS[link.plan];
     // Corte duro Free/Pro (lo hace la app; Metronome no bloquea): webhook de saldo 0 + consulta del saldo neto.
+    const blocked = { rejected: true, reason: "blocked" as RejectReason, duplicates: 0, accepted: [] as string[] };
     if (!plan.overage) {
-      if (link.accessCut) return { account: await toAccount(link), rejected: true, duplicates: 0 };
+      if (link.accessCut) return { account: await toAccount(link), ...blocked };
       const net = await H.getNetBalanceEur(ctx(), link.metronomeCustomerId);
-      if (net <= 0) return { account: await toAccount(link), rejected: true, duplicates: 0 };
+      if (net <= 0) return { account: await toAccount(link), ...blocked };
     }
     const valid = requests.filter(r => r.requestId);
-    const fresh = new Set(claimRequestIds(appUserId, valid.map(r => r.requestId)));
-    const todo = valid.filter(r => fresh.has(r.requestId));
+    // Límite de gasto del cliente (regla de la app): con la copia local del uso del periodo, a precio de plan.
+    // TODO(verificar): el periodo local es el mes natural UTC; en vivo debería usarse el periodo del contrato (upcoming.periodStart).
+    let capHit = false;
+    const inCap: UsageRequest[] = [];
+    if (link.spendCap) {
+      const now = new Date();
+      const periodStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1)).toISOString();
+      let spent = periodSpend(dailyFrom(read(db => db.usage[appUserId] ?? [])), periodStart);
+      for (const r of valid) {
+        const cost = requestCost(r, plan.discount);
+        if (!fitsCap(link.spendCap, spent, cost)) { capHit = true; break; }
+        spent += cost; inCap.push(r);
+      }
+    } else inCap.push(...valid);
+    const fresh = new Set(claimRequestIds(appUserId, inCap.map(r => r.requestId)));
+    const todo = inCap.filter(r => fresh.has(r.requestId));
     const c = ctx();
     await H.ingest(c, todo.flatMap(r => buildIngestEvents(c, appUserId, r)));
     // Copia local (coste estimado a precio de plan) solo para gráficas y listados.
     const local: UsageEvent[] = todo.flatMap(r => {
       const ts = r.ts ?? new Date().toISOString();
       const parts: [MetricId, number][] = [["input_tokens", r.inputTokens ?? 0], ["output_tokens", r.outputTokens ?? 0], ["images", r.images ?? 0]];
-      return parts.filter(([, q]) => q > 0).map(([metric, quantity]) => ({ id: `${r.requestId}:${metric}`, requestId: r.requestId, ts, metric, quantity, cost: usageCost(metric, quantity, plan.discount) }));
+      return parts.filter(([, q]) => q > 0).map(([metric, quantity]) => ({ id: `${r.requestId}:${metric}`, requestId: r.requestId, ts, metric, quantity, cost: usageCost(metric, quantity, plan.discount), source: r.source }));
     });
     tx(db => { db.usage[appUserId] = [...local, ...(db.usage[appUserId] ?? [])].slice(0, 5000); });
-    return { account: await toAccount(link), rejected: false, duplicates: valid.length - todo.length };
+    if (link.spendCap) {
+      const now = new Date();
+      const periodStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1)).toISOString();
+      const spent = periodSpend(dailyFrom(read(db => db.usage[appUserId] ?? [])), periodStart);
+      const cap = { ...link.spendCap };
+      const kinds = capAlerts(cap, capHit ? cap.monthlyEur : spent, periodStart);
+      if (kinds.length) {
+        saveLink({ ...getLink(appUserId)!, spendCap: cap });
+        for (const k of kinds) localAlert(link.metronomeCustomerId, "spend_cap", capMessage(k, cap, spent, eur), `cap${k}_${appUserId}_${periodStart.slice(0, 7)}`);
+      }
+    }
+    return { account: await toAccount(getLink(appUserId)!), rejected: capHit, reason: capHit ? "spend_cap" : undefined, duplicates: inCap.length - todo.length, accepted: todo.map(r => r.requestId) };
+  },
+  async setSpendCap(appUserId, monthlyEur) {
+    // Regla de la app (Metronome no rechaza peticiones). El aviso del 80 % lo emite la app al ingerir.
+    // TODO(verificar): alternativa en Metronome = alerta de cliente de tipo gasto/uso (p. ej. "usage_threshold_reached"
+    // sobre el total facturable) que llegue por webhook; no está en los helpers del setup.
+    const link = mustLink(appUserId);
+    const now = new Date();
+    const periodStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1)).toISOString();
+    const spent = periodSpend(dailyFrom(read(db => db.usage[appUserId] ?? [])), periodStart);
+    const cap = normalizeCap(monthlyEur, spent, link.spendCap);
+    saveLink({ ...link, spendCap: cap });
+    localAlert(link.metronomeCustomerId, "info", cap ? `Monthly spend limit set to ${eur(cap.monthlyEur)}.` : "Monthly spend limit removed.", `cap_${appUserId}_${Date.now()}`);
+    return toAccount(getLink(appUserId)!);
+  },
+  async grantGoodwill(appUserId, g) {
+    // Crédito de cortesía = crédito promocional con código único por concesión (uniqueness_key nebula-promo-<cliente>-GOODWILL-<id>).
+    // TODO(verificar): quizá convenga un producto propio "goodwill_credit" en el setup para separarlo en los informes.
+    const link = mustLink(appUserId);
+    const code = `GOODWILL-${g.grantId}`.slice(0, 60);
+    try {
+      await H.grantPromoCredit(ctx(), { customerId: link.metronomeCustomerId, contractId: link.metronomeContractId, code, label: `Goodwill credit (support): ${g.reason}`.slice(0, 120), amountEur: g.amountEur, validDays: g.validDays });
+    } catch (e) {
+      if (!/already redeemed/.test((e as Error).message)) throw e; // mismo grantId: idempotente
+    }
+    saveLink({ ...link, accessCut: false });
+    localAlert(link.metronomeCustomerId, "support", `Our support team added ${eur(g.amountEur)} of goodwill credit. Reason: ${g.reason}`, `gw_${g.grantId}`);
+    return toAccount(getLink(appUserId)!);
+  },
+  async unblock(appUserId) {
+    const link = mustLink(appUserId);
+    saveLink({ ...link, accessCut: false });
+    localAlert(link.metronomeCustomerId, "support", "Support has re-enabled your API access.", `unblock_${appUserId}_${Date.now()}`);
+    return toAccount(getLink(appUserId)!);
   },
 };
 

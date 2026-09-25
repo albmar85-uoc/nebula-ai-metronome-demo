@@ -5,15 +5,15 @@ export default function Home() {
   return (
     <main className="wrap">
       <section className="hero">
-        <span className="badge acc">API de IA generativa</span>
-        <h1>Paga solo por los tokens <span className="grad">que usas</span></h1>
-        <p>Texto e imágenes con una sola API. Empieza gratis con 5 € de créditos al mes, sube de plan cuando crezcas y recarga saldo con bonificación.</p>
+        <span className="badge acc">Generative AI API</span>
+        <h1>Pay only for the tokens <span className="grad">you use</span></h1>
+        <p>Text and images with a single API. Start free with €5 in credits every month, upgrade as you grow and top up your balance with bonus credit.</p>
         <div className="row" style={{ justifyContent: "center", marginTop: 24 }}>
-          <Link href="/signup" className="btn primary">Crear cuenta gratis</Link>
-          <a href="/api/demo" className="btn">Entrar con cuenta demo</a>
+          <Link href="/signup" className="btn primary">Create a free account</Link>
+          <a href="/api/demo" className="btn">Try the demo account</a>
         </div>
       </section>
-      <section id="precios" className="sec"><h2>Precios</h2><Pricing /></section>
+      <section id="pricing" className="sec"><h2>Pricing</h2><Pricing /></section>
     </main>
   );
 }

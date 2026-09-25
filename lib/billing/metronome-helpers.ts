@@ -69,7 +69,7 @@ export function buildPrepaidBalanceThresholdConfig(ctx: Ctx, enabled = true) {
     recharge_to_amount: amt(ctx, ctx.ids.auto_recharge?.recharge_to_eur ?? AUTO_RECHARGE.rechargeTo),
     commit: {
       product_id: ctx.ids.products.fixed.auto_recharge,
-      name: "Recarga automática",
+      name: "Auto-recharge",
       priority: PRIORITIES.autoRecharge,
       applicable_product_tags: [USAGE_TAG],
       // `duration` y `rollover_fraction` están en la spec oficial (PrepaidBalanceThresholdCommit, https://docs.metronome.com/openapi.json)
@@ -85,7 +85,7 @@ export function buildSpendThresholdConfig(ctx: Ctx, enabled = true, thresholdEur
   return {
     is_enabled: enabled,
     threshold_amount: amt(ctx, thresholdEur),
-    commit: { product_id: ctx.ids.products.fixed.spend_threshold, name: "Cobro anticipado de uso", priority: PRIORITIES.spendThreshold },
+    commit: { product_id: ctx.ids.products.fixed.spend_threshold, name: "Early usage charge", priority: PRIORITIES.spendThreshold },
     payment_gate_config: STRIPE_PAYMENT_INTENT_GATE,
   } satisfies Metronome.V1.ContractCreateParams["spend_threshold_configuration"];
 }
@@ -95,9 +95,9 @@ export function buildPlanContractBody(ctx: Ctx, o: PlanContractOptions): Metrono
   const plan = PLANS[o.plan];
   const eurId = ctx.ids.credit_types.EUR;
   const startingAt = o.startingAt ?? floorToHour();
-  if (o.autoRecharge && !plan.autoRechargeAllowed) throw new Error(`La recarga automática no está disponible en ${plan.name}`);
-  if (o.spendThreshold && o.plan !== "scale") throw new Error("spend_threshold_configuration solo se ofrece en Scale");
-  if (o.spendThreshold && o.autoRecharge) throw new Error("Usa recarga automática (prepago) O spend threshold (cobro anticipado del gasto), no ambos en el mismo contrato");
+  if (o.autoRecharge && !plan.autoRechargeAllowed) throw new Error(`Auto-recharge is not available on ${plan.name}`);
+  if (o.spendThreshold && o.plan !== "scale") throw new Error("spend_threshold_configuration is only offered on Scale");
+  if (o.spendThreshold && o.autoRecharge) throw new Error("Use auto-recharge (prepaid) OR spend threshold (early overage charge), not both on the same contract");
   const multiplier = round2(1 - plan.discount);
   return {
     customer_id: o.customerId,
@@ -112,7 +112,7 @@ export function buildPlanContractBody(ctx: Ctx, o: PlanContractOptions): Metrono
     custom_fields: { nebula_plan: o.plan },
     recurring_credits: [
       {
-        name: `Créditos ${plan.name}`,
+        name: `${plan.name} credits`,
         product_id: ctx.ids.products.fixed.plan_credits,
         access_amount: { credit_type_id: eurId, unit_price: amt(ctx, plan.monthlyCredits), quantity: 1 },
         commit_duration: { value: 1, unit: "PERIODS" },
@@ -198,7 +198,7 @@ export function nextPeriodStart(anchorIso: string, now = new Date()): string {
 /** Subida: transición RENEWAL inmediata (prorrateo). Bajada: transición al inicio del siguiente periodo. */
 export async function changePlan(ctx: Ctx, customerId: string, newPlan: PlanId, opts: { now?: Date } = {}): Promise<PlanChangeResult> {
   const current = await getActiveContract(ctx, customerId);
-  if (!current) throw new Error(`El cliente ${customerId} no tiene contrato activo`);
+  if (!current) throw new Error(`Customer ${customerId} has no active contract`);
   const summary = summarizeContract(current);
   const currentPlan = summary.plan in PLANS ? (summary.plan as PlanId) : undefined;
   if (currentPlan === newPlan) return { kind: "same", fromContractId: current.id, effectiveAt: new Date().toISOString() };
@@ -227,7 +227,7 @@ export function buildBundleCommitEdit(ctx: Ctx, p: { customerId: string; contrac
     add_commits: [
       {
         type: "PREPAID",
-        name: `Bundle ${b.price} €`,
+        name: `Bundle €${b.price}`,
         product_id: ctx.ids.products.fixed.bundle_commit,
         access_schedule: { credit_type_id: eurId, schedule_items: [{ amount: amt(ctx, b.price), starting_at: start, ending_before: addMonths(start, b.validityMonths) }] },
         invoice_schedule: { credit_type_id: eurId, schedule_items: [{ amount: amt(ctx, b.price), timestamp: start }] },
@@ -263,7 +263,7 @@ export function buildBundleBonusEdit(ctx: Ctx, p: { customerId: string; contract
     uniqueness_key: `nebula-bonus-${p.purchaseId}`.slice(0, 128),
     add_credits: [
       {
-        name: `Bonus bundle ${b.price} € (+${bonus} €)`,
+        name: `Bundle bonus €${b.price} (+€${bonus})`,
         product_id: ctx.ids.products.fixed.bundle_bonus,
         access_schedule: { credit_type_id: ctx.ids.credit_types.EUR, schedule_items: [{ amount: amt(ctx, bonus), starting_at: start, ending_before: addMonths(start, b.validityMonths) }] },
         priority: PRIORITIES.bundleBonus,
@@ -298,8 +298,8 @@ export async function findBundleCommit(ctx: Ctx, customerId: string, purchaseId:
 export async function buildAutoRechargeEdit(ctx: Ctx, customerId: string, contractId: string, enabled: boolean): Promise<Metronome.V2.ContractEditParams | undefined> {
   const c = await getContract(ctx, customerId, contractId);
   const s = summarizeContract(c);
-  if (enabled && s.plan in PLANS && !PLANS[s.plan as PlanId].autoRechargeAllowed) throw new Error("Recarga automática solo en Pro y Scale");
-  if (enabled && s.spendThreshold?.enabled) throw new Error("Desactiva antes el cobro anticipado por umbral (no se pueden combinar)");
+  if (enabled && s.plan in PLANS && !PLANS[s.plan as PlanId].autoRechargeAllowed) throw new Error("Auto-recharge is only available on Pro and Scale");
+  if (enabled && s.spendThreshold?.enabled) throw new Error("Turn off the early threshold charge first (they can't be combined)");
   if (!c.prepaid_balance_threshold_configuration) {
     if (!enabled) return undefined;
     return { customer_id: customerId, contract_id: contractId, add_prepaid_balance_threshold_configuration: buildPrepaidBalanceThresholdConfig(ctx, true) };
@@ -321,8 +321,8 @@ export async function setAutoRecharge(ctx: Ctx, customerId: string, contractId: 
 export async function buildSpendThresholdEdit(ctx: Ctx, customerId: string, contractId: string, enabled: boolean, thresholdEur = ctx.ids.spend_threshold.scale_threshold_eur): Promise<Metronome.V2.ContractEditParams | undefined> {
   const c = await getContract(ctx, customerId, contractId);
   const s = summarizeContract(c);
-  if (enabled && s.plan !== "scale") throw new Error("El cobro anticipado por umbral solo está disponible en Scale");
-  if (enabled && s.autoRecharge?.enabled) throw new Error("Desactiva antes la recarga automática (no se pueden combinar)");
+  if (enabled && s.plan !== "scale") throw new Error("The early threshold charge is only available on Scale");
+  if (enabled && s.autoRecharge?.enabled) throw new Error("Turn off auto-recharge first (they can't be combined)");
   if (!c.spend_threshold_configuration) {
     if (!enabled) return undefined;
     return { customer_id: customerId, contract_id: contractId, add_spend_threshold_configuration: buildSpendThresholdConfig(ctx, true, thresholdEur) };
@@ -545,7 +545,7 @@ export async function grantPromoCredit(ctx: Ctx, p: Parameters<typeof buildPromo
     const item = body.add_credits![0].access_schedule.schedule_items[0];
     return { code: p.code.toUpperCase(), label: body.add_credits![0].name!, amountEur: p.amountEur, startsAt: item.starting_at, expiresAt: item.ending_before, contractId: p.contractId, editId: res.data.id };
   } catch (e) {
-    if (isConflict(e)) throw new Error(`Ya has canjeado el código ${p.code.toUpperCase()}`);
+    if (isConflict(e)) throw new Error(`You have already redeemed the code ${p.code.toUpperCase()}`);
     throw e;
   }
 }

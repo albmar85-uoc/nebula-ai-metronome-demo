@@ -4,3 +4,6 @@ node_modules
 .env.local
 data
 *.tsbuildinfo
+.next-e2e
+test-results
+playwright-report

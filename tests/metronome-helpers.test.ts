@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import * as H from "@/lib/billing/metronome-helpers";
-import { loadMetronomeIds, type MetronomeIds } from "@/lib/billing/metronome-config";
+import { fromEnv, loadMetronomeIds, promotionFromIds, type MetronomeIds } from "@/lib/billing/metronome-config";
 import { buildIngestEvents, mapGrant, mapInvoice } from "@/lib/billing/metronome";
 import type Metronome from "@metronome/sdk";
 
@@ -29,7 +29,7 @@ function parseDryRun(): Record<string, Call[]> {
   return out;
 }
 
-describe.skipIf(!hasSetup)("paridad con los helpers del setup (dry-run-helpers.txt)", () => {
+describe.skipIf(!hasSetup)("parity with the setup helpers (dry-run-helpers.txt)", () => {
   const ids = JSON.parse(fs.readFileSync(path.join(SETUP, "metronome-ids.dry-run.json"), "utf8")) as MetronomeIds;
   const ctx = { client: null as unknown as Metronome, ids };
   const S = hasSetup ? parseDryRun() : {};
@@ -41,50 +41,50 @@ describe.skipIf(!hasSetup)("paridad con los helpers del setup (dry-run-helpers.t
   it.each([["2a", "free", {}], ["2b", "pro", { autoRecharge: true }], ["2c", "scale", { spendThreshold: true }]] as const)("contrato %s (%s)", (sec, plan, extra) => {
     expect(H.buildPlanContractBody(ctx, { customerId: CUSTOMER, plan, startingAt: "2026-09-25T18:00:00.000Z", ...extra })).toEqual(post(sec, "/v1/contracts/create"));
   });
-  it("subida Pro → Scale = transición RENEWAL inmediata con el ancla del contrato anterior", () => {
+  it("upgrade Pro → Scale = immediate RENEWAL transition anchored to the previous contract", () => {
     const want = post("3", "/v1/contracts/create");
     const body = H.buildPlanContractBody(ctx, { customerId: CUSTOMER, plan: "scale", startingAt: H.floorToHour(new Date("2026-09-25T18:22:00Z")), billingAnchorDate: "2026-09-03T10:00:00.000Z", fromContractId: CONTRACT, autoRecharge: true });
     expect(body).toEqual(want);
     expect(body.transition).toEqual({ type: "RENEWAL", from_contract_id: CONTRACT });
   });
-  it("bajada Pro → Free = transición al inicio del siguiente periodo", () => {
+  it("downgrade Pro → Free = transition at the start of the next period", () => {
     const startingAt = H.nextPeriodStart("2026-09-03T10:00:00.000Z", new Date("2026-09-25T18:22:00Z"));
     expect(startingAt).toBe("2026-10-03T10:00:00.000Z");
     expect(H.buildPlanContractBody(ctx, { customerId: CUSTOMER, plan: "free", startingAt, billingAnchorDate: "2026-09-03T10:00:00.000Z", fromContractId: CONTRACT })).toEqual(post("3b", "/v1/contracts/create"));
   });
-  it("bundle: commit con payment gate y, aparte, el bonus (uniqueness_key por id de compra)", () => {
+  it("bundle: commit with payment gate and, separately, the bonus (uniqueness_key by purchase id)", () => {
     const commit = post("4", "/v2/contracts/edit", 0);
     const now = new Date(commit.add_commits[0].access_schedule.schedule_items[0].starting_at);
     expect(H.buildBundleCommitEdit(ctx, { customerId: CUSTOMER, contractId: CONTRACT, bundle: "b200", purchaseId: "pur_demo_001", now })).toEqual(commit);
     expect(H.buildBundleBonusEdit(ctx, { customerId: CUSTOMER, contractId: CONTRACT, bundle: "b200", purchaseId: "pur_demo_001", now })).toEqual(post("4", "/v2/contracts/edit", 1));
     expect(commit.uniqueness_key).toBe("nebula-bundle-pur_demo_001");
   });
-  it("alerta del 20 % por plan", () => {
+  it("20% alert per plan", () => {
     expect(H.buildLowBalanceAlertBody(ctx, CUSTOMER, "pro")).toEqual(post("6", "/v1/alerts/create"));
   });
-  it("crédito promocional con caducidad (WELCOME del setup = BIENVENIDA10 de la web)", () => {
+  it("expiring promo credit (WELCOME10, same code in the setup and the web app)", () => {
     const want = post("9", "/v2/contracts/edit");
     const now = new Date(want.add_credits[0].access_schedule.schedule_items[0].starting_at);
-    expect(H.buildPromoCreditEdit(ctx, { customerId: CUSTOMER, contractId: CONTRACT, code: "WELCOME", label: "Bono de bienvenida", amountEur: 10, validDays: 30, now })).toEqual(want);
+    expect(H.buildPromoCreditEdit(ctx, { customerId: CUSTOMER, contractId: CONTRACT, code: "WELCOME10", label: "Welcome bonus", amountEur: 10, validDays: 30, now })).toEqual(want);
   });
-  it("ingesta: mismo formato de evento que llmRequestEvent / imageGenerationEvent", () => {
+  it("ingest: same event shape as llmRequestEvent / imageGenerationEvent", () => {
     const events = S["7"].find(c => c.path === "/v1/ingest")!.body as any[];
     const llm = events.find(e => e.event_type === "nebula_llm_request");
     const img = events.find(e => e.event_type === "nebula_image_generation");
     expect(H.llmRequestEvent(ctx, { transactionId: llm.transaction_id, customer: llm.customer_id, inputTokens: llm.properties.input_tokens, outputTokens: llm.properties.output_tokens, model: llm.properties.model, timestamp: llm.timestamp })).toEqual(llm);
     expect(H.imageGenerationEvent(ctx, { transactionId: img.transaction_id, customer: img.customer_id, images: img.properties.images, model: img.properties.model, timestamp: img.timestamp })).toEqual(img);
   });
-  it("uso de 30 días: ventana a medianoche UTC y las 3 métricas", () => {
+  it("30-day usage: window at UTC midnight and the 3 metrics", () => {
     const want = post("12", "/v1/usage");
     const got = H.buildUsageLast30DaysBody(ctx, CUSTOMER, new Date(new Date(want.ending_before).getTime() - 3600_000));
     expect(got).toEqual(want);
   });
 });
 
-describe("ingesta idempotente con el id de petición de la app", () => {
+describe("idempotent ingest with the app's request id", () => {
   const ids = { event_types: { input_tokens: "nebula_llm_request", output_tokens: "nebula_llm_request", images: "nebula_image_generation" }, event_properties: { input_tokens: "input_tokens", output_tokens: "output_tokens", images: "images" } } as unknown as MetronomeIds;
   const ctx = { client: null as unknown as Metronome, ids };
-  it("transaction_id = requestId; no fusiona peticiones; texto+imágenes → sufijo determinista", () => {
+  it("transaction_id = requestId; requests are not merged; text+images → deterministic suffix", () => {
     const a = buildIngestEvents(ctx, "usr_1", { requestId: "req-A", inputTokens: 10, outputTokens: 5, ts: "2026-09-25T10:00:00.000Z" });
     const b = buildIngestEvents(ctx, "usr_1", { requestId: "req-B", images: 2, ts: "2026-09-25T10:00:01.000Z" });
     const c = buildIngestEvents(ctx, "usr_1", { requestId: "req-C", inputTokens: 1, images: 1 });
@@ -96,8 +96,8 @@ describe("ingesta idempotente con el id de petición de la app", () => {
   });
 });
 
-describe("webhooks → acción (interpretWebhook)", () => {
-  it("umbral 0 ⇒ cortar; >0 ⇒ ofrecer recarga; payment_gate.* ⇒ acciones de pago", () => {
+describe("webhooks → action (interpretWebhook)", () => {
+  it("threshold 0 ⇒ cut off; >0 ⇒ offer top-up; payment_gate.* ⇒ payment actions", () => {
     const alert = (threshold: number) => ({ id: "x", type: "alerts.low_remaining_contract_credit_and_commit_balance_reached", properties: { customer_id: "c", threshold, remaining_balance: 3 } });
     expect(H.interpretWebhook(alert(0))).toEqual({ action: "cut_access", customerId: "c" });
     expect(H.interpretWebhook(alert(6))).toEqual({ action: "offer_top_up", customerId: "c", remainingEur: 3 });
@@ -107,19 +107,19 @@ describe("webhooks → acción (interpretWebhook)", () => {
   });
 });
 
-describe("vista previa de la próxima factura a partir de facturas DRAFT", () => {
-  it("solo DRAFT USAGE del periodo en curso; suma cargos y créditos aplicados", () => {
+describe("next-invoice preview from DRAFT invoices", () => {
+  it("only DRAFT USAGE for the current period; sums charges and applied credits", () => {
     const inv = (id: string, start: string, end: string, type = "USAGE") => ({
       id, status: "DRAFT", type, periodStart: start, periodEnd: end, totalEur: 12, currency: "EUR",
-      lines: [{ name: "Tokens", type: "usage", totalEur: 20 }, { name: "Cuota", type: "subscription", totalEur: 29 }, { name: "Créditos", type: "applied_commit_or_credit", totalEur: -37 }],
+      lines: [{ name: "Tokens", type: "usage", totalEur: 20 }, { name: "Fee", type: "subscription", totalEur: 29 }, { name: "Credits", type: "applied_commit_or_credit", totalEur: -37 }],
     });
     const p = H.previewFromDrafts("c", [inv("cur", "2026-09-01T00:00:00Z", "2026-10-01T00:00:00Z"), inv("fut", "2026-10-01T00:00:00Z", "2026-11-01T00:00:00Z"), inv("sch", "2026-09-01T00:00:00Z", "2026-10-01T00:00:00Z", "SCHEDULED")], "k", "2026-09-25T12:00:00Z");
     expect(p).toMatchObject({ grossChargesEur: 49, creditsAppliedEur: 37, totalDueEur: 12, draftInvoiceIds: ["cur"] });
   });
 });
 
-describe("mapeos a la UI", () => {
-  it("CreditGrantView → CreditGrant y InvoiceView → Invoice", () => {
+describe("UI mappings", () => {
+  it("CreditGrantView → CreditGrant and InvoiceView → Invoice", () => {
     expect(mapGrant({ id: "g", kind: "bundle_bonus", metronomeType: "CREDIT", name: "Bonus", productId: "p", grantedEur: 30, remainingEur: 12, expiresAt: "2027-09-01T00:00:00Z", reference: "pur_1" }))
       .toMatchObject({ kind: "gift", amount: 30, remaining: 12, reference: "pur_1" });
     expect(mapGrant({ id: "g", kind: "promo", metronomeType: "CREDIT", name: "P", productId: "p", grantedEur: 10, remainingEur: 10 }).kind).toBe("promo");
@@ -129,21 +129,40 @@ describe("mapeos a la UI", () => {
   });
 });
 
-describe("carga de metronome-ids.json (formato del setup)", () => {
+describe("loading metronome-ids.json (setup format)", () => {
   const env = { ...process.env };
   afterEach(() => { process.env = { ...env }; });
   const write = (obj: unknown) => { const f = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "ids-")), "metronome-ids.json"); fs.writeFileSync(f, JSON.stringify(obj)); process.env.METRONOME_IDS_FILE = f; return f; };
-  it.skipIf(!hasSetup)("lee el formato del setup y rechaza un fichero de dry-run", () => {
+  it.skipIf(!hasSetup)("reads the setup format and rejects a dry-run file", () => {
     const dry = JSON.parse(fs.readFileSync(path.join(SETUP, "metronome-ids.dry-run.json"), "utf8"));
     write(dry);
-    expect(() => loadMetronomeIds()).toThrow(/dry-run/);
+    expect(() => loadMetronomeIds()).toThrow(/dry run/);
     write({ ...dry, dry_run: false, generated_at: "2026-09-25T19:00:00Z" });
     const ids = loadMetronomeIds();
     expect(ids.products.fixed.bundle_commit).toBe(dry.products.fixed.bundle_commit);
     expect(ids.auto_recharge.recharge_to_eur).toBe(50);
     expect(ids.amount_scale).toBe(1);
+    // display_name por plan/bundle y lista de promociones del setup
+    expect(ids.catalog.plans.pro.display_name).toBe("Pro");
+    expect(ids.catalog.bundles.b200.display_name).toBe("€200 bundle (+€30 bonus)");
+    expect(promotionFromIds(ids, " welcome10 ")).toMatchObject({ code: "WELCOME10", label: "Welcome bonus", amount: 10, validDays: 30 });
+    expect(promotionFromIds(ids, "BIENVENIDA10")).toBeUndefined();
+    // un fichero antiguo sin catalog.promotions/display_name se completa con el catálogo de la web
+    write({ ...dry, dry_run: false, generated_at: "2026-09-25T19:01:00Z", catalog: { plans: {}, bundles: {} } });
+    const old = loadMetronomeIds();
+    expect(old.catalog.plans.scale.display_name).toBe("Scale");
+    expect(Object.keys(old.catalog.promotions)).toEqual(["WELCOME10", "LAUNCH25"]);
   });
-  it("sin fichero, construye el mismo objeto con variables de entorno; si faltan, dice cuáles", () => {
+  it("the web catalog matches the setup's (plans, bundles with display_name, promotions)", () => {
+    const dry = JSON.parse(fs.readFileSync(path.join(SETUP, "metronome-ids.dry-run.json"), "utf8"));
+    process.env.METRONOME_IDS_FILE = "/no/existe.json";
+    const web = fromEnv({} as NodeJS.ProcessEnv);
+    for (const k of ["free", "pro", "scale"] as const) { const { subscription_product_id: _s, ...want } = dry.catalog.plans[k]; expect(web.catalog.plans[k]).toEqual(want); }
+    expect(web.catalog.bundles).toEqual(dry.catalog.bundles);
+    expect(web.catalog.promotions).toEqual(dry.catalog.promotions);
+    expect(web.auto_recharge).toEqual({ threshold_eur: 10, recharge_to_eur: 50 }); // valor por defecto sin fichero de IDs
+  });
+  it("without a file, builds the same object from environment variables; if any are missing, lists them", () => {
     process.env.METRONOME_IDS_FILE = "/no/existe.json";
     expect(() => loadMetronomeIds()).toThrow(/credit_types\.EUR/);
     Object.assign(process.env, {
@@ -157,6 +176,6 @@ describe("carga de metronome-ids.json (formato del setup)", () => {
     const ids = loadMetronomeIds();
     expect(ids.products.usage.images).toBe("p3");
     expect(ids.products.fixed.promo_credit).toBe("f6");
-    expect(ids._source).toBe("variables de entorno");
+    expect(ids._source).toBe("environment variables");
   });
 });

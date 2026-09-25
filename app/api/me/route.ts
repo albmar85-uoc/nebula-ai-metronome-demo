@@ -7,7 +7,7 @@ export const dynamic = "force-dynamic";
 export async function GET() {
   const cid = currentCustomerId();
   const a = cid ? await billing.get(cid) : null;
-  if (!a) return NextResponse.json({ error: "Sin sesión" }, { status: 401 });
+  if (!a) return NextResponse.json({ error: "Not signed in" }, { status: 401 });
   return NextResponse.json(view(a));
 }
 export async function DELETE() {

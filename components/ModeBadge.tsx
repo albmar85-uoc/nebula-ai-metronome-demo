@@ -6,8 +6,8 @@ export default function ModeBadge({ compact = false }: { compact?: boolean }) {
   if (!cfg) return null;
   const live = cfg.mode === "metronome";
   return (
-    <span className={`mode ${live ? "live" : "sim"}`} title={live ? "Las operaciones llaman a la API real de Metronome y Stripe" : "Todo se simula en local; no se llama a Metronome ni a Stripe"}>
-      <i />{compact ? (live ? "En vivo" : "Simulado") : live ? "Metronome en vivo" : "Modo simulado"}
+    <span className={`mode ${live ? "live" : "sim"}`} title={live ? "Actions call the real Metronome and Stripe APIs" : "Everything is simulated locally; Metronome and Stripe are not called"}>
+      <i />{compact ? (live ? "Live" : "Simulated") : live ? "Live Metronome" : "Simulated mode"}
     </span>
   );
 }

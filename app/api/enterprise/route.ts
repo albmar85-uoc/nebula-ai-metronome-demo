@@ -9,7 +9,7 @@ export async function POST(req: Request) {
   const company = String(b.company ?? "").trim().slice(0, 120);
   const email = String(b.email ?? "").trim().slice(0, 200);
   const monthlySpend = Math.max(0, Number(b.monthlySpend) || 0);
-  if (!company || !/^\S+@\S+\.\S+$/.test(email)) return NextResponse.json({ error: "Indica empresa y un correo válido" }, { status: 400 });
+  if (!company || !/^\S+@\S+\.\S+$/.test(email)) return NextResponse.json({ error: "Enter a company and a valid email" }, { status: 400 });
   const id = `lead_${Date.now().toString(36)}`;
   addEnterpriseLead({ id, ts: new Date().toISOString(), company, email, monthlySpend });
   // Compromiso sugerido: 12 × gasto mensual estimado (mínimo 12 000 €), redondeado a miles.

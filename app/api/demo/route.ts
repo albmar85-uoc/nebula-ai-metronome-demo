@@ -11,7 +11,7 @@ import type { DailyUsage, UsageRequest } from "@/lib/billing/types";
 export const dynamic = "force-dynamic";
 export async function GET(req: Request) {
   if (isLive()) return NextResponse.redirect(new URL("/signup", req.url));
-  const a = await billing.signup({ name: "Cuenta demo", email: "demo@nebula.ai", plan: "pro" });
+  const a = await billing.signup({ name: "Demo account", email: "demo@nebula.ai", plan: "pro" });
   await billing.buyBundle(a.customerId, "b50", `demo-${a.customerId}`);
   const day = 86400_000;
   const periodStart = +new Date(a.periodStart);

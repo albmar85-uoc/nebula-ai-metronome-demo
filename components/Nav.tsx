@@ -8,27 +8,31 @@ import { PLANS, eur } from "@/lib/catalog";
 export default function Nav() {
   const { account, logout } = useAccount();
   const path = usePathname();
-  const cls = (href: string) => (path?.startsWith(href) ? "on" : "");
+  const cur = (href: string) => (path?.startsWith(href) ? { className: "on", "aria-current": "page" as const } : {});
   return (
-    <nav className="nav">
-      <Link href="/" className="logo">nebula<span>.ai</span></Link>
-      <ModeBadge />
-      <div className="links">
-        <Link href="/#precios">Precios</Link>
-        {account && <Link href="/dashboard" className={cls("/dashboard")}>Consumo</Link>}
-        {account && <Link href="/billing" className={cls("/billing")}>Facturación</Link>}
-      </div>
-      <div className="right">
-        {account ? (
-          <>
-            <span className="badge acc hide-sm">{PLANS[account.plan].name}</span>
-            <span className={`badge ${account.blocked ? "bad" : ""}`}>{eur(account.balance)}</span>
-            <button className="btn small" onClick={logout}>Salir</button>
-          </>
-        ) : (
-          <Link href="/signup" className="btn primary small">Empezar gratis</Link>
-        )}
-      </div>
-    </nav>
+    <header>
+      <nav className="nav" aria-label="Main">
+        <Link href="/" className="logo" aria-label="nebula.ai, home">nebula<span>.ai</span></Link>
+        <ModeBadge />
+        <div className="links">
+          <Link href="/#pricing">Pricing</Link>
+          {account && <Link href="/dashboard" {...cur("/dashboard")}>Usage</Link>}
+          {account && <Link href="/billing" {...cur("/billing")}>Billing</Link>}
+          {account && <Link href="/keys" {...cur("/keys")}>API keys</Link>}
+          <Link href="/docs" {...cur("/docs")}>Docs</Link>
+        </div>
+        <div className="right">
+          {account ? (
+            <>
+              <span className="badge acc hide-sm">{PLANS[account.plan].name}</span>
+              <span className={`badge ${account.blocked ? "bad" : ""}`} aria-label={`Balance: ${eur(account.balance)}${account.blocked ? ", access paused" : ""}`}>{eur(account.balance)}</span>
+              <button className="btn small" onClick={logout}>Sign out</button>
+            </>
+          ) : (
+            <Link href="/signup" className="btn primary small">Start free</Link>
+          )}
+        </div>
+      </nav>
+    </header>
   );
 }

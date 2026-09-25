@@ -3,7 +3,7 @@
 // de forma atómica (fichero temporal + rename) en cada cambio.
 import fs from "node:fs";
 import path from "node:path";
-import type { Account, Alert, UsageEvent } from "./billing/types";
+import type { Account, Actor, Alert, UsageEvent } from "./billing/types";
 import type { BundleId, PlanId } from "./catalog";
 
 /** Enlace entre el usuario de la app y sus IDs externos (modo en vivo). */
@@ -18,8 +18,25 @@ export type CustomerLink = {
   metronomeCustomerId: string;
   metronomeContractId: string;
   stripeCustomerId?: string;
+  spendCap?: import("./billing/types").SpendCap; // límite de gasto del cliente (lo aplica la app)
   createdAt: string;
 };
+
+/** Clave de API por usuario. Solo se guarda el hash (SHA-256 con pimienta opcional); el secreto se muestra una vez. */
+export type ApiKey = {
+  id: string;
+  customerKey: string; // id de sesión (cuenta simulada o appUserId en vivo)
+  name: string;
+  prefix: string; // primeros caracteres visibles, p. ej. "nbl_test_3f9a"
+  hash: string;
+  createdAt: string;
+  lastUsedAt?: string;
+  revokedAt?: string;
+};
+
+/** Historial de plan/contrato (lo registra la app en ambos modos). */
+export type PlanEvent = { ts: string; kind: "signup" | "upgrade" | "downgrade_scheduled" | "downgrade_applied" | "downgrade_cancelled"; from?: PlanId; to: PlanId; actor: Actor; effectiveAt?: string; contractId?: string };
+export type AdminLogEntry = { id: string; ts: string; customerKey: string; action: string; detail: string };
 
 /** Compra de bundle: el regalo se concede solo tras payment_gate.payment_status = paid, emparejando por purchaseId. */
 export type Purchase = {
@@ -42,9 +59,12 @@ type DB = {
   seenWebhooks: { id: string; ts: string }[]; // deduplicación de webhooks por id (persistida en disco)
   seenRequests: Record<string, string[]>; // modo en vivo: ids de petición ya enviados a /v1/ingest por usuario
   enterpriseLeads: { id: string; ts: string; company: string; email: string; monthlySpend: number }[];
+  apiKeys: ApiKey[];
+  planHistory: Record<string, PlanEvent[]>;
+  adminLog: AdminLogEntry[];
 };
 
-const empty = (): DB => ({ version: 1, accounts: {}, links: {}, alerts: {}, usage: {}, purchases: [], seenWebhooks: [], seenRequests: {}, enterpriseLeads: [] });
+const empty = (): DB => ({ version: 1, accounts: {}, links: {}, alerts: {}, usage: {}, purchases: [], seenWebhooks: [], seenRequests: {}, enterpriseLeads: [], apiKeys: [], planHistory: {}, adminLog: [] });
 
 const g = globalThis as unknown as { __db?: { file: string; data: DB } };
 
@@ -57,7 +77,7 @@ function load(): DB {
   try {
     data = { ...empty(), ...JSON.parse(fs.readFileSync(file, "utf8")) };
   } catch (e) {
-    if ((e as NodeJS.ErrnoException).code !== "ENOENT") console.error("[store] db.json ilegible, se empieza de cero:", e);
+    if ((e as NodeJS.ErrnoException).code !== "ENOENT") console.error("[store] unreadable db.json, starting from scratch:", e);
   }
   g.__db = { file, data };
   return data;
@@ -131,3 +151,21 @@ export function claimRequestIds(appUserId: string, ids: string[]): string[] {
 }
 
 export const addEnterpriseLead = (l: DB["enterpriseLeads"][number]) => tx(db => { db.enterpriseLeads.unshift(l); db.enterpriseLeads = db.enterpriseLeads.slice(0, 200); });
+
+// --- Claves de API ---
+export const addApiKey = (k: ApiKey) => tx(db => { db.apiKeys.push(k); });
+export const listApiKeys = (customerKey: string) => read(db => db.apiKeys.filter(k => k.customerKey === customerKey));
+export const findApiKeyByHash = (hash: string) => read(db => db.apiKeys.find(k => k.hash === hash) ?? null);
+export const updateApiKey = (id: string, patch: Partial<ApiKey>) => tx(db => { const k = db.apiKeys.find(x => x.id === id); if (k) Object.assign(k, patch); return k ?? null; });
+
+// --- Historial de plan y registro de soporte ---
+export const addPlanEvent = (customerKey: string, e: PlanEvent) => tx(db => { (db.planHistory[customerKey] ??= []).unshift(e); db.planHistory[customerKey] = db.planHistory[customerKey].slice(0, 100); });
+export const getPlanHistory = (customerKey: string) => read(db => db.planHistory[customerKey] ?? []);
+export const addAdminLog = (e: AdminLogEntry) => tx(db => { db.adminLog.unshift(e); db.adminLog = db.adminLog.slice(0, 1000); });
+export const getAdminLog = (customerKey?: string) => read(db => (customerKey ? db.adminLog.filter(e => e.customerKey === customerKey) : db.adminLog));
+
+/** Ids de sesión de todos los clientes (simulados o enlazados en vivo), del más reciente al más antiguo. */
+export const listCustomerKeys = (mode: "mock" | "metronome") =>
+  read(db => (mode === "mock"
+    ? Object.values(db.accounts).sort((a, b) => b.periodStart.localeCompare(a.periodStart)).map(a => a.customerId)
+    : Object.values(db.links).sort((a, b) => b.createdAt.localeCompare(a.createdAt)).map(l => l.appUserId)));

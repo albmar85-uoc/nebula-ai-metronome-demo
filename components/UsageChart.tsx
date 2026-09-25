@@ -5,7 +5,7 @@ import type { DailyUsage } from "@/lib/billing/types";
 import type { UsageLast30Days } from "@/lib/billing/metronome-types";
 
 const COLORS: Record<MetricId, string> = { input_tokens: "#7c5cff", output_tokens: "#22d3a6", images: "#f5a524" };
-const fmt = (n: number) => new Intl.NumberFormat("es-ES", { notation: n >= 100_000 ? "compact" : "standard", maximumFractionDigits: 1 }).format(n);
+const fmt = (n: number) => new Intl.NumberFormat("en-US", { notation: n >= 100_000 ? "compact" : "standard", maximumFractionDigits: 1 }).format(n);
 type Mode = "cost" | MetricId;
 
 /**
@@ -26,26 +26,27 @@ export default function UsageChart({ usage30, daily }: { usage30?: UsageLast30Da
         v[m] = { q, c: localCost || q * METRICS[m].pricePerUnit };
       }
       const d = new Date(`${day}T00:00:00Z`);
-      return { day, label: d.toLocaleDateString("es-ES", { day: "numeric", month: "short", timeZone: "UTC" }), dayNum: d.getUTCDate(), v };
+      return { day, label: d.toLocaleDateString("en-US", { day: "numeric", month: "short", timeZone: "UTC" }), dayNum: d.getUTCDate(), v };
     });
   }, [usage30, daily]); // eslint-disable-line react-hooks/exhaustive-deps
   const val = (r: (typeof rows)[number]) => (mode === "cost" ? metrics.reduce((s, m) => s + r.v[m].c, 0) : r.v[mode].q);
   const max = Math.max(...rows.map(val), mode === "cost" ? 0.01 : 1);
   const total = rows.reduce((s, r) => s + val(r), 0);
+  const peak = rows.reduce((p, r) => (val(r) > val(p) ? r : p), rows[0]);
   return (
     <div>
-      <div className="row tabs" role="tablist">
-        <button role="tab" aria-selected={mode === "cost"} className={`chip ${mode === "cost" ? "on" : ""}`} onClick={() => setMode("cost")}>Coste</button>
-        {metrics.map(m => <button key={m} role="tab" aria-selected={mode === m} className={`chip ${mode === m ? "on" : ""}`} onClick={() => setMode(m)}><i style={{ background: COLORS[m] }} />{METRICS[m].name}</button>)}
+      <div className="row tabs" role="group" aria-label="Chart metric">
+        <button type="button" aria-pressed={mode === "cost"} className={`chip ${mode === "cost" ? "on" : ""}`} onClick={() => setMode("cost")}>Cost</button>
+        {metrics.map(m => <button type="button" key={m} aria-pressed={mode === m} className={`chip ${mode === m ? "on" : ""}`} onClick={() => setMode(m)}><i style={{ background: COLORS[m] }} />{METRICS[m].name}</button>)}
         <span className="sp" />
-        <span className="muted" style={{ fontSize: 13 }}>30 días · {mode === "cost" ? eur(total) : `${fmt(total)} ${METRICS[mode].unit}`}</span>
+        <span className="muted" style={{ fontSize: 13 }}>30 days · {mode === "cost" ? eur(total) : `${fmt(total)} ${METRICS[mode].unit}`}</span>
       </div>
-      <div className="hchart h30" aria-label="Uso diario de los últimos 30 días">
+      <div className="hchart h30" role="img" aria-label={`Daily usage over the last 30 days (${mode === "cost" ? "cost" : METRICS[mode].name}): total ${mode === "cost" ? eur(total) : `${fmt(total)} ${METRICS[mode].unit}`}; busiest day: ${peak.label} (${mode === "cost" ? eur(val(peak)) : fmt(val(peak))}).`}>
         {rows.map((r, i) => {
           const t = val(r);
           const title = mode === "cost" ? `${r.label}: ${eur(t)}\n` + metrics.map(m => `${METRICS[m].name}: ${eur(r.v[m].c)}`).join("\n") : `${r.label}: ${fmt(t)} ${METRICS[mode].unit}`;
           return (
-            <div key={r.day} className="col" title={title}>
+            <div key={r.day} className="col" title={title} aria-hidden="true">
               <div className="stack" style={{ height: `${(t / max) * 100}%` }}>
                 {mode === "cost"
                   ? metrics.map(m => r.v[m].c > 0 && <i key={m} style={{ flexGrow: r.v[m].c, background: COLORS[m] }} />)
