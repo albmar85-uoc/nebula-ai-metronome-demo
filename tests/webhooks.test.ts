@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import { mockBilling } from "@/lib/billing/mock";
 import { handleMetronomeEvent, signMetronome, verifyMetronomeSignature } from "@/lib/webhooks";
+import { _resetCache } from "@/lib/store";
 import { freshDataDir } from "./helpers";
 
 const H = (h: Record<string, string>) => ({ get: (n: string) => h[Object.keys(h).find(k => k.toLowerCase() === n.toLowerCase()) ?? ""] ?? null });
@@ -46,14 +47,35 @@ describe("procesado de webhooks", () => {
     expect(al).toMatchObject({ type: "low_balance", verified: true });
     expect(al.message).toContain("4,50");
   });
-  it("saldo 0 → zero_balance; pago confirmado libera el regalo pendiente", async () => {
+  it("saldo 0 → zero_balance (y corte en Pro); payment_gate.* se guardan como avisos de pago", async () => {
     const a = await mockBilling.signup({ name: "A", email: "a@x", plan: "pro" });
-    await handleMetronomeEvent({ id: "e2", type: "alerts.low_remaining_contract_credit_and_commit_balance_reached", properties: { customer_id: a.customerId, remaining_balance: 0 } }, { verified: false });
-    const released: string[] = [];
-    await handleMetronomeEvent({ id: "e3", type: "payment_gate.payment_status", properties: { customer_id: a.customerId, contract_id: "c-1", workflow_type: "manual_commit", payment_status: "paid" } }, { verified: true, onPaymentPaid: async c => { released.push(c); } });
-    expect(released).toEqual(["c-1"]);
+    await handleMetronomeEvent({ id: "e2", type: "alerts.low_remaining_contract_credit_and_commit_balance_reached", properties: { customer_id: a.customerId, threshold: 0, remaining_balance: 0 } }, { verified: false });
+    expect((await mockBilling.get(a.customerId))!.blocked).toBe(true);
+    const r = await handleMetronomeEvent({ id: "e3", type: "payment_gate.threshold_reached", properties: { customer_id: a.customerId, contract_id: "c-1", workflow_type: "spend" } }, { verified: true });
+    expect(r).toMatchObject({ status: "stored", action: "threshold_charge_started" });
+    await handleMetronomeEvent({ id: "e4", type: "payment_gate.payment_status", properties: { customer_id: a.customerId, contract_id: "c-1", workflow_type: "spend", payment_status: "paid" } }, { verified: true });
     const got = await mockBilling.get(a.customerId);
     expect(got!.alerts.map(x => x.type)).toEqual(expect.arrayContaining(["zero_balance", "payment"]));
+    expect(got!.alerts.some(x => x.message.includes("umbral de gasto"))).toBe(true);
+    expect(got!.blocked).toBe(false); // un pago confirmado levanta el corte
+  });
+  it("un cobro por umbral fallido corta el acceso", async () => {
+    const a = await mockBilling.signup({ name: "A", email: "a@x", plan: "pro" });
+    await handleMetronomeEvent({ id: "f1", type: "payment_gate.payment_status", properties: { customer_id: a.customerId, contract_id: "c", workflow_type: "spend", payment_status: "failed", error_message: "tarjeta rechazada" } }, { verified: true });
+    const got = await mockBilling.get(a.customerId);
+    expect(got!.blocked).toBe(true);
+    expect(got!.alerts.some(x => x.message.includes("tarjeta rechazada"))).toBe(true);
+  });
+  it("la deduplicación se guarda en disco y sobrevive a un reinicio", async () => {
+    const a = await mockBilling.signup({ name: "A", email: "a@x", plan: "pro" });
+    const ev = { id: "evt-persist", type: "payment_gate.payment_pending_action_required", properties: { customer_id: a.customerId, contract_id: "c" } };
+    expect((await handleMetronomeEvent(ev, { verified: true })).status).toBe("stored");
+    _resetCache(); // reinicio del proceso
+    expect((await handleMetronomeEvent(ev, { verified: true })).status).toBe("duplicate");
+  });
+  it("clientes desconocidos y tipos no gestionados no fallan", async () => {
+    expect((await handleMetronomeEvent({ id: "u1", type: "payment_gate.payment_status", properties: { customer_id: "nadie", contract_id: "c", payment_status: "paid" } }, { verified: true })).status).toBe("unknown_customer");
+    expect((await handleMetronomeEvent({ id: "u2", type: "contract.edit", properties: {} }, { verified: true })).status).toBe("ignored");
   });
   it("la firma generada coincide con la verificación", () => {
     const date = new Date().toUTCString();

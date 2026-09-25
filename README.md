@@ -9,55 +9,61 @@ En todas las pantallas se ve un indicador **«Modo simulado»** (ámbar) o **«M
 
 ## Catálogo (datos de ejemplo)
 
-| | Free | Pro | Scale |
-|---|---|---|---|
-| Cuota mensual | 0 € | 29 € | 199 € |
-| Créditos incluidos/mes | 5 € | 30 € | 250 € |
-| Descuento en uso | – | 10 % | 20 % |
-| Al llegar a 0 € | se corta el acceso | se corta el acceso (o recarga automática) | el exceso se factura a fin de mes |
+| | Free | Pro | Scale | Enterprise |
+|---|---|---|---|---|
+| Cuota mensual | 0 € | 29 € | 199 € | compromiso anual (desde 12 000 €) |
+| Créditos incluidos/mes | 5 € | 30 € | 250 € | – (el uso consume el compromiso) |
+| Descuento en uso | – | 10 % | 20 % | precios negociados por métrica |
+| Al llegar a 0 € | se corta el acceso | se corta el acceso (o recarga automática) | el exceso se factura a fin de mes; cobro anticipado cada 300 € de exceso | true-up al final del año |
 
-Uso: tokens de entrada 2 €/M, tokens de salida 8 €/M, imágenes 0,04 €. Bundles: pagas 50 → recibes 55; 200 → 230; 1000 → 1200. Recarga automática (Pro/Scale): si el saldo baja de 10 €, se recarga ~50 €. Alerta de saldo bajo al 20 % y a 0.
+Uso: tokens de entrada 2 €/M, tokens de salida 8 €/M, imágenes 0,04 €. Bundles (12 meses): pagas 50 → recibes 55; 200 → 230; 1000 → 1200. Recarga automática (Pro/Scale): si el saldo baja de 10 €, se cobra lo necesario para dejarlo en 50 €. Códigos promocionales: `BIENVENIDA10` (10 €, 30 días) y `LANZAMIENTO25` (25 €, 60 días). Aviso de saldo bajo al 20 % de los créditos del plan y a 0 €.
+
+Los créditos del plan se prorratean en el primer mes y caducan cada mes. Bundles, regalos y promociones se conservan al cambiar de plan.
 
 ## Arquitectura
 
 ```mermaid
 flowchart LR
   subgraph Navegador
-    L[Landing / precios] --> S[Alta /signup]
-    D[Panel /dashboard<br/>simulador, histórico, alertas]
-    B[Facturación /billing<br/>planes, bundles, recarga, facturas]
-    I[Detalle de factura<br/>/billing/invoices/:id]
+    L[Landing / precios<br/>+ tarjeta Enterprise] --> S[Alta /signup]
+    E[/enterprise<br/>solicitud de propuesta/]
+    D[Panel /dashboard<br/>uso 30 días, próxima factura,<br/>simulador, alertas]
+    B[Facturación /billing<br/>planes, bundles, recarga,<br/>umbral Scale, promo, facturas]
+    I[Detalle de factura]
   end
   subgraph "Next.js 14 (App Router)"
     API[/app/api/*/]
     P{{"lib/billing/index.ts<br/>¿METRONOME_LIVE=1?"}}
-    M[mock.ts<br/>simulación]
-    R[metronome.ts<br/>adaptador real]
-    ST[(data/db.json<br/>cuentas simuladas,<br/>enlaces usuario ↔ Metronome ↔ Stripe,<br/>alertas, uso local)]
-    WH[/api/webhooks/metronome<br/>verifica firma HMAC/]
+    M[mock.ts<br/>simulación + cierre de mes]
+    R[metronome.ts<br/>orquestación]
+    HL[metronome-helpers.ts<br/>port de los helpers del setup]
+    ST[(data/db.json<br/>cuentas simuladas, enlaces usuario ↔ Metronome ↔ Stripe,<br/>compras pendientes, webhooks vistos, ids de petición)]
+    WH[/api/webhooks/metronome<br/>firma HMAC + interpretWebhook/]
   end
-  S & D & B & I --> API --> P
+  IDS[(../metronome-setup/<br/>metronome-ids.json)]
+  S & D & B & I & E --> API --> P
   P -- no --> M --> ST
-  P -- sí --> R --> ST
-  R -- "@metronome/sdk" --> MET[(Metronome API)]
+  P -- sí --> R --> HL -- "@metronome/sdk 3.10.0" --> MET[(Metronome API)]
+  R --> ST
+  IDS --> HL
   S -. "modo en vivo" .-> SC[Stripe Checkout<br/>modo setup]
   SC --> RET[/api/stripe/return/] --> R
   MET -- "cobra facturas y commits<br/>(PaymentIntent)" --> STR[(Stripe)]
   MET -- webhooks --> WH --> ST
+  WH -- "corte / regalo del bundle" --> M & R
 ```
-
-Piezas principales:
 
 | Fichero | Qué hace |
 |---|---|
-| `lib/catalog.ts` | Métricas, planes, bundles, recarga automática, umbral de alertas. |
-| `lib/billing/types.ts` | Interfaz `BillingProvider` y tipo `Account` (lo que ve la UI). |
-| `lib/billing/mock.ts` | Simulación: prorrateo, orden de consumo, bloqueo, exceso, recarga, alertas, factura en borrador. |
-| `lib/billing/metronome.ts` | Adaptador real (SDK oficial). Constructores de cuerpos puros + mapeo de respuestas a `Account`. |
-| `lib/billing/metronome-config.ts` | Lee los IDs de `metronome-ids.json` (o variables de entorno). |
-| `lib/store.ts` | Almacén JSON con escritura atómica: cuentas simuladas, tabla de enlaces, alertas, webhooks vistos. |
-| `lib/webhooks.ts` | Verificación de firma de Metronome y procesado de eventos. |
-| `lib/stripe.ts`, `app/api/stripe/*` | Stripe Checkout en modo setup (solo en vivo). |
+| `lib/catalog.ts` | Métricas, planes (con `rank`), bundles, recarga (10 → 50 €), umbral de Scale (300 €), prioridades, promociones, ejemplo Enterprise. |
+| `lib/billing/metronome-types.ts` | **Copia literal** de `metronome-setup/types.ts` (contrato de datos de la UI: `UpcomingInvoicePreview`, `UsageLast30Days`, `EnterpriseContractSummary`, `WebhookAction`…). |
+| `lib/billing/metronome-helpers.ts` | **Port a `@metronome/sdk` de `metronome-setup/src/helpers/*`**, con los mismos nombres (`buildPlanContractBody`, `changePlan`, `buildBundleCommitEdit`, `grantBundleBonus`, `findBundleCommit`, `syncPlanLowBalanceAlert`, `getUpcomingInvoicePreview`, `getUsageLast30Days`, `grantPromoCredit`, `interpretWebhook`…) y los mismos cuerpos. Un test comprueba que son **idénticos** a los de `dry-run-helpers.txt`. |
+| `lib/billing/metronome-config.ts` | Lee `metronome-ids.json` en el formato del setup (`MetronomeIds` de `src/ids.ts`); sin fichero construye el mismo objeto con variables de entorno. Rechaza ficheros de dry-run. |
+| `lib/billing/metronome.ts` | Modo en vivo: enlace usuario ↔ IDs, idempotencia con ids de la app, corte Free/Pro, regalo tras el pago, mapeo a `Account`. |
+| `lib/billing/mock.ts` | Simulación con la misma semántica (transiciones, cierre de mes, compras con pago confirmado por webhook, promos, umbral de gasto, dedupe por id de petición). |
+| `lib/billing/insights.ts` | Cálculos puros: uso de 30 días, `recommendPlan`, propuesta Enterprise. |
+| `lib/webhooks.ts` | Firma + `interpretWebhook` → acciones: aviso, corte de acceso, regalo del bundle, avisos de pago. |
+| `lib/store.ts` | JSON con escritura atómica: cuentas simuladas, enlaces, compras (`purchases`), webhooks vistos, ids de petición, solicitudes Enterprise. |
 
 ## Arrancar en modo simulado
 
@@ -67,39 +73,37 @@ npm run build && npm start      # http://localhost:3000  (o npm run dev)
 npm test                        # tests unitarios (vitest)
 ```
 
-- `http://localhost:3000/api/demo` crea una cuenta Pro de ejemplo, con consumo de los últimos días, y entra en el panel.
+- `http://localhost:3000/api/demo` crea una cuenta Pro de ejemplo (bundle de 50 € comprado, 30 días de histórico) y entra en el panel.
 - Los datos se guardan en `./data/db.json`. Si lo borras, empiezas de cero.
-- Prueba de webhook en simulado (sin secreto se acepta y se marca como «sin firma»):
+- Prueba de webhook en simulado (sin secreto se acepta y se marca como «sin firma»). `threshold: 0` es la alerta global de saldo 0 y corta el acceso en Free/Pro:
 
 ```bash
 curl -X POST localhost:3000/api/webhooks/metronome -H 'content-type: application/json' \
-  -d '{"id":"prueba-1","type":"alerts.low_remaining_contract_credit_and_commit_balance_reached","properties":{"customer_id":"<customerId de /api/me>","remaining_balance":4.5,"alert_name":"Saldo bajo"}}'
+  -d '{"id":"prueba-1","type":"alerts.low_remaining_contract_credit_and_commit_balance_reached","properties":{"customer_id":"<customerId de /api/me>","threshold":0,"remaining_balance":0}}'
 ```
+
+- Ingesta idempotente: `POST /api/usage` con `{"requests":[{"requestId":"req-1","inputTokens":1000,"outputTokens":500}]}`. Si repites el mismo `requestId`, responde `duplicates: 1` y no cobra.
 
 ## Pasar a modo en vivo
 
-1. Ejecuta el setup del experto de Metronome (`/workspace/metronome-setup`, `npx tsx src/setup.ts`). Genera `metronome-ids.json`.
+1. Ejecuta el setup del experto (`cd ../metronome-setup && npm run setup`, **sin** `--dry-run`). Genera `metronome-ids.json`. La web lo lee de `../metronome-setup/metronome-ids.json` (o de `METRONOME_IDS_FILE`).
 2. Copia `.env.example` a `.env` y rellena:
 
 | Variable | Obligatoria | Qué es / quién la aporta |
 |---|---|---|
 | `METRONOME_LIVE=1` | sí | Activa el modo en vivo (sin ella, la demo sigue simulada aunque haya token). |
-| `METRONOME_API_TOKEN` (o `METRONOME_API_KEY`) | sí | Token de API de Metronome (**experto de Metronome**; mejor el entorno sandbox conectado a Stripe en modo test). |
-| `METRONOME_IDS_FILE` | no | Ruta al fichero de IDs. Por defecto `../metronome-setup/metronome-ids.json`. |
-| `METRONOME_WEBHOOK_SECRET` | sí | Secreto del webhook creado en Metronome apuntando a `https://<app>/api/webhooks/metronome` (**experto de Metronome**). |
-| `STRIPE_SECRET_KEY` | sí | Clave secreta de Stripe de la **misma cuenta** conectada a Metronome (**experto de Stripe**). |
-| `STRIPE_PUBLISHABLE_KEY` | no | No hace falta con Checkout alojado; se deja preparada. |
+| `METRONOME_API_KEY` (o `METRONOME_API_TOKEN` / `METRONOME_BEARER_TOKEN`) | sí | Token del **Sandbox** de Metronome conectado a Stripe en modo test (**experto de Metronome**). |
+| `METRONOME_IDS_FILE` | no | Ruta al fichero de IDs. |
+| `METRONOME_WEBHOOK_SECRET` | sí | Secreto del webhook apuntando a `https://<app>/api/webhooks/metronome`. |
+| `STRIPE_SECRET_KEY` | sí | Clave secreta de la **misma cuenta** de Stripe conectada a Metronome (**experto de Stripe**). |
 | `APP_URL` | recomendable | URL pública para las URLs de vuelta de Stripe. |
 | `METRONOME_*` (IDs sueltos) | no | Alternativa a `metronome-ids.json` (ver `.env.example`). |
 
-**Qué tiene que aportar cada experto**
-
-- **Metronome**: token de API; `metronome-ids.json` (credit type EUR, rate card con las tarifas de uso y de suscripción de Pro/Scale, productos FIXED para créditos del plan, commit del bundle, regalo y recarga automática); integración de Stripe activada en la cuenta; webhook y su secreto; confirmar que está activo el *payment gating* (y, si se quiere regalo en la recarga automática, el flag de `discount_configuration`).
-- **Stripe**: clave secreta (modo test); productos de Stripe asignados al campo `stripe_product_id` de los productos de commit de Metronome (lo exige el *payment gating*); confirmar que la cuenta de Stripe es la que está conectada a Metronome.
+Requisitos del dashboard (no se pueden hacer por API): ver la sección 3 del README de `metronome-setup` (Sandbox, conexión de Stripe, productos `prod_…` en Stripe y regla de mapeo `stripe_product_id`, webhook, método de pago por defecto, EUR habilitado).
 
 ### Formato de `metronome-ids.json`
 
-Se lee con tolerancia (acepta varias formas de clave). La forma que genera `metronome-setup/src/ids.ts`:
+Exactamente el de `metronome-setup/src/ids.ts` (ejemplo: `metronome-setup/metronome-ids.dry-run.json`):
 
 ```jsonc
 {
@@ -109,59 +113,79 @@ Se lee con tolerancia (acepta varias formas de clave). La forma que genera `metr
   "products": {
     "usage":        { "input_tokens": "…", "output_tokens": "…", "images": "…" },
     "subscription": { "pro": "…", "scale": "…" },
-    "fixed":        { "plan_credits": "…", "bundle_commit": "…", "bundle_bonus": "…", "auto_recharge": "…" }
+    "fixed": { "plan_credits": "…", "bundle_commit": "…", "bundle_bonus": "…", "auto_recharge": "…",
+               "spend_threshold": "…", "promo_credit": "…", "enterprise_commit": "…" }
   },
   "rate_card": { "id": "…", "alias": "nebula_eur" },
   "alerts": { "zero_balance": "…", "zero_balance_uniqueness_key": "nebula-zero-balance-eur-v1" },
+  "event_types": { "input_tokens": "nebula_llm_request", "output_tokens": "nebula_llm_request", "images": "nebula_image_generation" },
+  "event_properties": { "input_tokens": "input_tokens", "output_tokens": "output_tokens", "images": "images" },
+  "auto_recharge": { "threshold_eur": 10, "recharge_to_eur": 50 },
+  "spend_threshold": { "scale_threshold_eur": 300 },
+  "amount_scale": 1,
   "catalog": { "plans": { … }, "bundles": { … } }
 }
 ```
 
-Claves opcionales que también entiende la web: `event_types.{llm_request,image_generation}`, `plans.<plan>.package_id` (plantillas como *packages*), `auto_recharge.recharge_to_eur`, `amount_scale`, `threshold_discount`.
-
 ## Qué llamada de Metronome hay detrás de cada pantalla
 
-Todas las rutas del SDK se han comprobado contra el OpenAPI oficial (`https://docs.metronome.com/openapi.json`) y el compilador de TypeScript valida los cuerpos con los tipos del SDK. **Importes en EUR = unidades enteras** (solo USD va en céntimos: [doc](https://docs.metronome.com/guides/pricing-packaging/make-pricing-changes/use-currency-custompricingunits)).
+Los cuerpos son los de los helpers del setup (verificados por el experto contra `spec/openapi.json`), y además el compilador los valida con los tipos de `@metronome/sdk` 3.10.0. **Importes EUR = unidades enteras.**
 
-| Pantalla / endpoint de la web | Modo en vivo: llamadas |
+| Pantalla / endpoint | Modo en vivo (helper → endpoint) |
 |---|---|
-| `/signup` → `POST /api/stripe/setup-session` | Stripe: `customers.create` + `checkout.sessions.create({ mode: "setup", currency: "eur", billing_address_collection: "required" })`. |
-| `GET /api/stripe/return` | Stripe: `checkout.sessions.retrieve` + `customers.update(invoice_settings.default_payment_method)`. Metronome: `POST /v1/customers` (con `customer_billing_provider_configurations` → Stripe, `charge_automatically`, `ingest_aliases=[id local]`), `POST /v1/contracts/create` (rate card + `subscriptions` ADVANCE con `proration: { is_prorated, BILL_IMMEDIATELY }` + `recurring_credits` mensuales + `overrides` MULTIPLIER 0,9/0,8 + `billing_provider_configuration`), `POST /v1/alerts/create` (`low_remaining_contract_credit_and_commit_balance_reached`, umbral = 20 % de los créditos del plan). |
-| `GET /api/me`, `/dashboard`, `/billing` | `POST /v1/contracts/customerBalances/list` (saldos), `GET /v1/customers/{id}/invoices`, `POST /v2/contracts/get` (estado de la recarga automática). Uso por día: copia local de lo enviado a ingest (coste estimado). |
-| `POST /api/usage` (simulador) | Free/Pro: comprueba saldo (lista de saldos) y rechaza si es 0. Luego `POST /v1/ingest` (eventos `nebula_llm_request` y `nebula_image_generation`). |
-| `POST /api/plan/change` (subida) | `POST /v1/contracts/create` con `transition: { type: "RENEWAL", from_contract_id }` desde **ahora**: Metronome cierra el contrato anterior, cobra la cuota nueva prorrateada (ADVANCE) y prorratea los créditos del primer mes. Conserva la recarga automática. Es lo que [recomienda Metronome](https://docs.metronome.com/guides/pricing-packaging/subscription/manage-subscription-lifecycle) y lo mismo que hace `metronome-setup/src/helpers/contracts.ts`. |
-| `POST /api/plan/change` (bajada) | Igual, pero el contrato nuevo empieza el **día 1 del mes siguiente** (Metronome solo prorratea subidas). La web lo muestra como «programado». |
-| `POST /api/bundles/buy` | `POST /v2/contracts/edit` → `add_commits` PREPAID con `payment_gate_config: { STRIPE, PAYMENT_INTENT }`. El regalo (`add_credits`) se añade cuando llega `payment_gate.payment_status = paid`. |
-| `POST /api/autorecharge` | `POST /v2/contracts/edit` → `add_prepaid_balance_threshold_configuration` (umbral 10, recargar hasta 60, commit con payment gate de Stripe) o `update_prepaid_balance_threshold_configuration { is_enabled }`. |
-| `/billing/invoices/:id` → `GET /api/invoices/:id` | `GET /v1/customers/{id}/invoices/{invoice_id}` (líneas, estado, factura/pago de Stripe, PDF). En simulado incluye la factura de uso en borrador del mes. |
-| `POST /api/webhooks/metronome` | Verifica `HMAC_SHA256(secreto, X-Metronome-Date + "\n" + cuerpo)` = `Metronome-Webhook-Signature` (ventana de 5 min, deduplicado por `id`). Guarda alertas `alerts.*` y `payment_gate.*` por cliente. |
-| `GET /api/demo` | Solo simulado (en vivo redirige a `/signup`). |
+| `/signup` → `POST /api/stripe/setup-session` | Stripe `customers.create` + `checkout.sessions.create({ mode: "setup" })`. |
+| `GET /api/stripe/return` | Stripe `checkout.sessions.retrieve` + `customers.update(default_payment_method)`. `createCustomerWithStripe` (`GET /v1/customers?ingest_alias`, `POST /v1/customers`, idempotente por alias `usr_<hash del cliente de Stripe>`), `createPlanContract` (`POST /v1/contracts/create`, `uniqueness_key` `nebula-signup-<cliente>`; Scale con `spend_threshold_configuration`), `syncPlanLowBalanceAlert`. Recargar la URL no duplica nada. |
+| `GET /api/me`, `/dashboard`, `/billing` | `getBalanceSummary` (`customerBalances/list` + `getNetBalance`), `listInvoices`, `getContract` (`/v2/contracts/get`: recarga y umbral), `getUpcomingInvoicePreview` (DRAFT USAGE del periodo) → widget «Próxima factura», `getUsageLast30Days` (`POST /v1/usage`, DAY) → gráfico de 30 días + `recommendPlan`. |
+| `POST /api/usage` | Free/Pro: si un webhook de saldo 0 cortó el acceso, o `getNetBalanceEur` ≤ 0, se rechaza. Luego `ingest` (`POST /v1/ingest`): **un evento por petición** (`llmRequestEvent` / `imageGenerationEvent`) con `transaction_id` = **id de petición de la app**; si una petición trae texto e imágenes, la segunda lleva el sufijo `:images`. La web descarta localmente ids ya vistos. |
+| `POST /api/plan/change` | `changePlan`: `POST /v1/contracts/create` con `transition: { type: "RENEWAL", from_contract_id }`, mismo ancla de facturación (`CUSTOM_DATE`). Subida: desde ahora, prorrateo; bajada: desde el siguiente periodo (la web la muestra como programada y la aplica al llegar la fecha). Con `rollover_fraction: 1` en créditos y commits, el saldo pasa al contrato nuevo. Después, `syncPlanLowBalanceAlert` **archiva** la alerta del 20 % anterior y crea la del plan nuevo. |
+| `POST /api/bundles/buy` | Id de compra del navegador (`Idempotency-Key`). `buyBundle` → `/v2/contracts/edit` `add_commits` PREPAID con payment gate, `uniqueness_key nebula-bundle-<id>`, custom field `nebula_purchase_id`. Con el webhook `payment_gate.payment_status = paid` se recorren las compras pendientes del cliente; para cada una, `findBundleCommit` (por `nebula_purchase_id`) y, **solo si el commit existe**, `grantBundleBonus` (`nebula-bonus-<id>`). Si el pago falla, la compra queda como fallida. |
+| `POST /api/autorecharge` | `setAutoRecharge` → `add_/update_prepaid_balance_threshold_configuration` (10 → 50 €, commit con payment gate). |
+| `POST /api/spend-threshold` (Scale) | `setSpendThreshold` → `add_/update_spend_threshold_configuration` (300 €, payment gate Stripe). No se puede combinar con la recarga automática. |
+| `POST /api/promo` | `grantPromoCredit` → `add_credits` con caducidad, prioridad 3, `uniqueness_key nebula-promo-<cliente>-<código>` (409 ⇒ «ya canjeado»). |
+| `/enterprise` → `POST /api/enterprise` | Demo: guarda la solicitud en local y devuelve una propuesta de ejemplo (`EnterpriseContractSummary`). En real, ventas usaría `createEnterpriseContract` del setup (no se llama desde la web). |
+| `/billing/invoices/:id` | `getInvoice` (`GET /v1/customers/{id}/invoices/{invoice_id}`). |
+| `POST /api/webhooks/metronome` | Firma HMAC (`X-Metronome-Date` o `Date`, 5 min) → `interpretWebhook`: `offer_top_up` (aviso), `cut_access` (alerta global de 0 € ⇒ corte en Free/Pro), `payment_succeeded` (regalo del bundle y fin del corte), `payment_failed` (compra fallida; si es el cobro por umbral, corte), `payment_requires_action` (3DS), `threshold_charge_started` (`payment_gate.threshold_reached`). Se deduplica por `id` en `db.json` **después** de procesar (si falla, responde 500 y Metronome reintenta). |
 
-Orden de consumo del saldo: **créditos mensuales → regalo → commits**, con `priority` 1 / 5 / 10 (igual que `metronome-setup`). Todos los créditos y commits llevan `applicable_product_ids` = productos de uso, para que no paguen la cuota de suscripción, y `rollover_fraction: 1`, para que el saldo comprado pase al contrato nuevo en los cambios de plan.
+Prioridades de consumo (iguales al setup): plan 1 → promo 3 → regalo del bundle 5 → commits pagados 10 → Enterprise 20. Todos los créditos y commits se aplican con el tag `nebula_usage` (no pagan la cuota).
 
-**Alineado con `metronome-setup`**: forma de `metronome-ids.json`, EUR en unidades enteras, dos tipos de evento (`nebula_llm_request`, `nebula_image_generation`), productos FIXED (`plan_credits`, `bundle_commit`, `bundle_bonus`, `auto_recharge`), prioridades, cambio de plan con transición, regalo tras `payment_gate.payment_status = paid`, alerta global de saldo 0 (la web no la duplica) y custom fields `nebula_plan` / `nebula_bundle` cuando el fichero viene del setup. Diferencias que quedan: la web aplica los descuentos con `applicable_product_ids` (el setup usa el tag `nebula_usage`; son equivalentes) y todavía no rellena `nebula_purchase_id`.
+### Revisión del experto (sección 8 de su README): estado
+
+| # | Punto | Estado |
+|---|---|---|
+| 1 | La subida editaba el contrato | ✅ Subida y bajada por transición RENEWAL (`changePlan`). En simulado, la subida conserva el saldo y la bajada se programa y mantiene bundle, regalo y promos (test). |
+| 2 | Créditos completos con cuota prorrateada | ✅ Proration por defecto (FIRST_AND_LAST) como el setup. El simulado también prorratea el primer mes. |
+| 3 | Sin `rollover_fraction` | ✅ `rollover_fraction: 1` en créditos del plan, bundle, regalo, promo y recarga automática. |
+| 4 | Regalos emparejados por contrato | ✅ Por `purchaseId` (custom field `nebula_purchase_id` + `findBundleCommit`). Las compras fallidas o de más de 24 h sin commit se cierran. |
+| 5 | `uniqueness_key` aleatorias | ✅ Deterministas: `nebula-signup-<cliente>`, `nebula-<cliente>-<plan>-<inicio>`, `nebula-bundle/bonus-<id de compra>`, `nebula-promo-<cliente>-<código>`, `nebula-low-<cliente>-<plan>`. Los 409 se tratan como «ya hecho». |
+| 6 | No se archivaban las alertas del 20 % | ✅ `syncPlanLowBalanceAlert` en el alta, en la subida y al aplicarse una bajada. |
+| 7 | Recarga hasta 60 vs 50 | ✅ 50 € (de `auto_recharge.recharge_to_eur`); el simulado también «recarga hasta 50». |
+| 8 | Ingesta fusionada con `transaction_id` aleatorio | ✅ Un evento por petición con `transaction_id` = id de la petición de la app; dedupe también en local. |
+| 9 | `package_id` sin `billing_provider_configuration` | ✅ Eliminada la ruta de *packages* (el setup no los crea). |
+| 10 | `update_contract_end_date` antes de la transición | ✅ Eliminado: solo la transición. |
+| 11 | El corte dependía solo de `listBalances` | ✅ Webhook de saldo 0 (`cut_access`) + `getNetBalance` antes de ingerir. |
+| 12 | Dedupe en memoria; faltan `threshold_reached` y `workflow_type: "spend"` | ✅ Dedupe persistida en `db.json` (5000 ids / 7 días) y marcada tras procesar; `payment_gate.threshold_reached` y `payment_status` de `spend` gestionados. (La dedupe ya se guardaba en `db.json` antes: el experto leyó `store` como memoria.) |
 
 ## Tests
 
-`npm test` (vitest, 27 tests):
+`npm test` (vitest, 58 tests):
 
-- `tests/mock-billing.test.ts`: alta, prorrateo en subida/bajada, orden de consumo mensual → regalo → commit, bloqueo a 0 en Free y Pro, exceso en Scale, recarga automática, alerta del 20 % (una sola vez), persistencia tras «reinicio».
-- `tests/webhooks.test.ts`: firma con el **vector oficial de la documentación**, cabecera `Date` de compatibilidad, cuerpo alterado, notificaciones antiguas, deduplicación y liberación del regalo al confirmarse el pago.
-- `tests/metronome-bodies.test.ts`: lectura de `metronome-ids.json` con la forma de `metronome-setup` y fallback a variables de entorno; cuerpos de cliente, contrato (Pro/Free), cambio de plan con transición, bundle, regalo, recarga automática e ingesta; mapeo de saldos. (El lector también se ha probado a mano con `metronome-setup/metronome-ids.dry-run.json`.)
+- `tests/mock-billing.test.ts` (32): alta con prorrateo (y aviso inmediato si nace bajo el 20 %), subida con rollover, **bajada programada que conserva bundle y regalo**, cancelación de bajada, re-sincronización del aviso del 20 %, cierre de mes (exceso facturado, cuota y créditos nuevos), orden plan → promo → regalo → commit, bloqueo Free/Pro, **regalo solo tras el webhook de pago** (y no con un pago fallido o un segundo pago), compra idempotente, **ingesta idempotente por id de petición**, umbral de gasto en Scale (cobro de 300 €), exclusión recarga/umbral, recarga hasta 50 €, promos (canje único, caducidad), corte por webhook de saldo 0 (no en Scale), próxima factura, uso de 30 días, `recommendPlan`, propuesta Enterprise, persistencia.
+- `tests/webhooks.test.ts` (9): firma con el **vector oficial de la documentación**, cabecera `Date`, rechazo de cuerpo alterado y de notificaciones antiguas, `threshold_reached`, cobro por umbral fallido ⇒ corte, **dedupe que sobrevive a un reinicio**, clientes desconocidos.
+- `tests/metronome-helpers.test.ts` (17): **paridad exacta con `metronome-setup/dry-run-helpers.txt`** (cliente, contratos Free/Pro/Scale, subida y bajada por transición, bundle + bonus, alerta del 20 %, promo, eventos de ingesta, `/v1/usage`), transaction ids deterministas, `interpretWebhook`, vista previa desde facturas DRAFT, mapeos a la UI, cargador de IDs (formato del setup, rechazo de dry-run, variables de entorno).
 
 ## TODO abiertos
 
-Marcados en el código como `// TODO(verificar)` con la URL de la documentación:
+Marcados en el código como `// TODO(verificar)` o descritos aquí:
 
-1. **Nada del modo en vivo se ha ejecutado contra Metronome real** (no hay credenciales). Los cuerpos se validan con los tipos del SDK y con tests, pero falta una pasada en sandbox.
-2. **Créditos al subir de plan**: con la transición y `rollover_fraction: 1`, el saldo restante de los créditos del plan anterior también pasa al contrato nuevo, y los créditos del nuevo plan se prorratean. El modo simulado, en cambio, solo añade la diferencia prorrateada. Hay que decidir cuál se quiere (con 0 en los créditos recurrentes no pasarían). [Doc](https://docs.metronome.com/guides/pricing-packaging/apply-credits-and-commits/create-a-pre-paid-commit)
-3. **Primer mes**: en Metronome los créditos del primer mes se prorratean (proration FIRST_AND_LAST, como en el setup) y la cuota también; el modo simulado da el mes completo. [Doc](https://docs.metronome.com/guides/pricing-packaging/subscription/manage-subscription-lifecycle)
-4. **Alineación de fechas**: `starting_at` de contratos y commits se redondea a la hora; confirmar si alguna fecha exige el día. [OpenAPI](https://docs.metronome.com/openapi.json)
-5. **Recarga automática**: Metronome «recarga hasta» un saldo (no compra un bundle fijo). Con el fichero del setup se usa su `recharge_to_eur = 50` (commit ≈ 40 €); sin fichero, la web usa 60 (≈ commit de 50 €, como dice el catálogo). Hay que decidir uno (`auto_recharge.recharge_to_eur` / `METRONOME_RECHARGE_TO_EUR`). El +10 % de regalo en la recarga requiere `discount_configuration` (feature flag). [Doc](https://docs.metronome.com/guides/customers-billing/optimize-customer-experience/prepaid-balance-thresholds)
-6. **Regalo del bundle**: se concede con el webhook `payment_gate.payment_status` (paid, `workflow_type = manual_commit`) emparejando por contrato (FIFO). Si hay varias compras en paralelo convendría emparejar por `invoice_id` o por el custom field `nebula_purchase_id`. [Doc](https://docs.metronome.com/guides/pricing-packaging/apply-credits-and-commits/manual-payment-gated-commits)
-7. **Alertas**: el umbral de `low_remaining_contract_credit_and_commit_balance_reached` es un importe. Se crea una alerta del 20 % por cliente y plan (la de 0 € ya es global en el setup). Confirmar si 0 dispara al llegar a 0 y valorar alertas por plan en lugar de por cliente. Al cambiar de plan no se archiva la alerta anterior. [Doc](https://docs.metronome.com/guides/customers-billing/set-up-notifications/threshold-notifications)
-8. **Corte a 0 en Free/Pro**: Metronome no bloquea el uso y sus saldos se actualizan con cierto retraso tras la ingesta, así que puede colarse algo de uso. Para cortar en tiempo real haría falta un contador local o reaccionar al webhook de saldo 0.
-9. **Packages**: si el setup crea plantillas de plan como *packages*, se usa `package_id`, pero falta confirmar qué campos admite `contracts/create` junto a él.
-10. **Stripe**: la vuelta de Checkout no es idempotente si se recarga la URL (guardar los `session_id` ya procesados); hay que gestionar `payment_gate.payment_pending_action_required` (3D Secure) con un enlace de pago para el usuario.
-11. **Simulación**: no hay cierre de mes (renovación de créditos/cuota) ni reembolsos. La bajada de plan se aplica al momento, sin cobrar la cuota nueva hasta el ciclo siguiente.
-12. **Persistencia**: `data/db.json` vale para un único proceso. Con varias instancias haría falta una base de datos (SQLite/Postgres).
+1. **Nada del modo en vivo se ha ejecutado contra Metronome real** (no hay credenciales). Los cuerpos coinciden con los del setup (validados contra la spec) y con los tipos del SDK, pero falta una pasada en el Sandbox.
+2. **Tipos del SDK desfasados**: `duration` y `rollover_fraction` del commit de la recarga automática están en la spec (`PrepaidBalanceThresholdCommit`) pero no en las typings de `@metronome/sdk` 3.10.0; se envían fuera del tipo. Confirmar en el Sandbox.
+3. **Abono de la cuota al subir de plan** por transición (duda §7 del setup): el simulado abona la parte no consumida de la cuota anterior; confirmar qué hace Metronome.
+4. **Cancelar una bajada programada** en vivo: habría que archivar el contrato futuro (`/v1/contracts/archive`). No está en los helpers del setup; ahora la web pide contactar con soporte (en simulado sí se cancela).
+5. **Emparejado del webhook de pago**: `payment_gate.payment_status` no trae el id de compra. Se comprueba con `findBundleCommit`, pero con varias compras a la vez y un solo webhook de fallo, la que falla se detecta porque su commit no existe (y el resto sigue pendiente hasta su propio webhook o 24 h). Validar en el Sandbox que el commit aparece en `customerBalances/list` antes de que llegue el webhook.
+6. **Promociones**: la web valida los códigos (`BIENVENIDA10`, `LANZAMIENTO25`) y envía importe/validez explícitos; el setup trae `WELCOME`/`LAUNCH2026` con los mismos importes. Decidir los nombres definitivos. Duda del setup: ¿los créditos con rollover conservan su caducidad?
+7. **Alertas**: confirmar si la de 0 € salta al llegar a 0 o solo por debajo (§7 del setup). Con créditos prorrateados, un alta a final de mes puede empezar ya por debajo del umbral fijo del 20 % (Free: 0,87 € < 1 €) y, con `evaluate_on_create`, avisar al instante (el simulado lo reproduce). Valorar un umbral proporcional para el primer mes. El corte se levanta al confirmarse un pago o cuando `customerBalances` vuelve a dar saldo (con 2 min de margen por el retraso).
+8. **Auto-recarga y umbral de gasto** se tratan como excluyentes (igual que el setup); confirmar si pueden convivir. Los mínimos de la recarga (umbral ≥ 5, recarga ≥ umbral + 10) están en $ en la doc; se asume lo mismo en EUR.
+9. **Uso de 30 días en vivo**: `POST /v1/usage` da cantidades por métrica; el coste diario del gráfico se estima con la tarifa y el descuento del plan (la cifra facturada es la de las facturas).
+10. **Stripe 3D Secure**: `payment_gate.payment_pending_action_required` se muestra como aviso, pero falta un enlace para completar el pago.
+11. **Enterprise**: la solicitud solo se guarda en local (no se envía a nadie) y la propuesta es de ejemplo; no se llama a `createEnterpriseContract` desde la web.
+12. **Persistencia**: `data/db.json` vale para un único proceso. Con varias instancias haría falta una base de datos (SQLite/Postgres), sobre todo para las compras pendientes y la dedupe de webhooks.
