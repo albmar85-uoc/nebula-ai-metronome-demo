@@ -1,284 +1,72 @@
-// Adaptador real de Metronome (modo en vivo). Se activa con METRONOME_API_TOKEN + METRONOME_LIVE=1.
-//
-// Usa el SDK oficial @metronome/sdk (Stainless, tipado a partir del OpenAPI de Metronome), así que
-// los cuerpos de las peticiones se comprueban en compilación contra la especificación oficial.
-// Referencias:
-//   - API: https://docs.metronome.com/api-reference/introduction   (OpenAPI: https://docs.metronome.com/openapi.json)
-//   - Crear cliente:        POST /v1/customers                        https://docs.metronome.com/api-reference/customers/create-a-customer
-//   - Crear contrato:       POST /v1/contracts/create                 https://docs.metronome.com/api-reference/contracts/create-a-contract
-//   - Editar contrato:      POST /v2/contracts/edit                   https://docs.metronome.com/api-reference/contracts/edit-a-contract
-//   - Cambio de plan:       POST /v1/contracts/create con transition  https://docs.metronome.com/guides/pricing-packaging/subscription/manage-subscription-lifecycle
-//   - Leer contrato:        POST /v2/contracts/get                    https://docs.metronome.com/api-reference/contracts/get-a-contract-v2
-//   - Saldos:               POST /v1/contracts/customerBalances/list  https://docs.metronome.com/api-reference/credits-and-commits/list-balances
-//   - Facturas:             GET  /v1/customers/{id}/invoices[/{invoice_id}] https://docs.metronome.com/api-reference/invoices/list-invoices
-//   - Ingesta:              POST /v1/ingest                           https://docs.metronome.com/api-reference/usage/ingest-events
-//   - Alertas de saldo:     POST /v1/alerts/create                    https://docs.metronome.com/api-reference/alerts/create-a-threshold-notification
-//   - Recarga automática:   prepaid_balance_threshold_configuration   https://docs.metronome.com/guides/customers-billing/optimize-customer-experience/prepaid-balance-thresholds
-//   - Commits con pago:     payment_gate_config                       https://docs.metronome.com/guides/pricing-packaging/apply-credits-and-commits/manual-payment-gated-commits
-//
-// Importes: "USD es la única moneda en céntimos; EUR y el resto van en unidades enteras (10 € = 10)".
-//   https://docs.metronome.com/guides/pricing-packaging/make-pricing-changes/use-currency-custompricingunits
-//   Por eso money() multiplica por ids.amountScale (1 para EUR; 100 si alguien configura USD).
+// Adaptador real de Metronome (modo en vivo). Se activa con METRONOME_API_KEY (o METRONOME_API_TOKEN) + METRONOME_LIVE=1.
+// Toda la lógica de API está en metronome-helpers.ts (port de los helpers del experto, /workspace/metronome-setup/src/helpers);
+// aquí solo se orquesta: enlace usuario ↔ IDs externos (store), idempotencia con ids de la app y mapeo a la UI.
 import Metronome from "@metronome/sdk";
-import { randomUUID } from "node:crypto";
-import { AUTO_RECHARGE, BUNDLES, LOW_BALANCE_RATIO, METRICS, PLANS, eur, type BundleId, type MetricId, type PlanId } from "../catalog";
-import { addAlert, getAlerts, getLink, read, saveLink, tx, type CustomerLink } from "../store";
-import { loadMetronomeIds, type MetronomeIds } from "./metronome-config";
+import { createHash } from "node:crypto";
+import { METRICS, PLANS, PROMOTIONS, eur, type MetricId, type PlanId } from "../catalog";
+import { addAlert, addPurchase, claimRequestIds, getAlerts, getLink, getPurchase, pendingPurchases, read, resolvePurchase, saveLink, tx, findLinkByMetronomeId, type CustomerLink } from "../store";
+import { recommendPlan, usageLast30DaysFromDaily } from "./insights";
+import { loadMetronomeIds } from "./metronome-config";
+import * as H from "./metronome-helpers";
+import type { CreditGrantView, InvoiceView } from "./metronome-types";
 import { round, usageCost } from "./mock";
-import type { Account, Alert, BillingProvider, CreditGrant, DailyUsage, Invoice, InvoiceLine, SignupInput, UsageEvent } from "./types";
-
-// Prioridades de consumo (menor = antes), alineadas con metronome-setup/src/config.ts (PRIORITIES).
-// Metronome consume los prepagados por priority: https://docs.metronome.com/guides/pricing-packaging/apply-credits-and-commits/prioritization-rules
-export const PRIORITY = { recurring: 1, gift: 5, commit: 10 } as const;
+import type { Account, Alert, BillingProvider, CreditGrant, DailyUsage, Invoice, UsageEvent, UsageRequest } from "./types";
 
 let _client: Metronome | null = null;
-export const client = () => (_client ??= new Metronome({ bearerToken: process.env.METRONOME_API_TOKEN || process.env.METRONOME_API_KEY, webhookSecret: process.env.METRONOME_WEBHOOK_SECRET ?? null }));
+export const client = () =>
+  (_client ??= new Metronome({ bearerToken: process.env.METRONOME_API_KEY || process.env.METRONOME_API_TOKEN || process.env.METRONOME_BEARER_TOKEN, webhookSecret: process.env.METRONOME_WEBHOOK_SECRET ?? null }));
+export const ctx = (): H.Ctx => ({ client: client(), ids: loadMetronomeIds() });
 
-let scale = 1; // = ids.amountScale; lo fijan idsNow() y los constructores de cuerpos
-const idsNow = () => { const i = loadMetronomeIds(); scale = i.amountScale; return i; };
-const money = (n: number) => Math.round(n * scale * 10000) / 10000;
-const fromMoney = (n: number | undefined | null) => round((n ?? 0) / scale);
-/** Los créditos y commits solo pagan uso (si no, también se comerían la cuota de suscripción). */
-const usageOnly = (i: MetronomeIds) => Object.values(i.usageProducts);
+/** Id de usuario determinista por cliente de Stripe: repetir el retorno de Checkout no crea otro cliente (ingest alias idempotente). */
+export const appUserIdFor = (stripeCustomerId: string) => `usr_${createHash("sha256").update(stripeCustomerId).digest("hex").slice(0, 16)}`;
 
-/** Metronome exige marcas de tiempo alineadas a la hora en varias fechas de contrato. */
-export const hourFloor = (d = new Date()) => { const x = new Date(d); x.setUTCMinutes(0, 0, 0); return x.toISOString(); };
-// TODO(verificar): alineación exigida para starting_at de contratos/commits (hora vs. día).
-//   La especificación menciona "must be on an hour boundary" en algunos campos: https://docs.metronome.com/openapi.json
-export function utcMonth(d = new Date()) {
-  const start = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), 1));
-  const end = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 1, 1));
-  return { start: start.toISOString(), end: end.toISOString() };
+// ─────────────────────────── mapeos a la UI ───────────────────────────
+
+const KIND: Record<CreditGrantView["kind"], CreditGrant["kind"]> = {
+  plan_credit: "recurring", promo: "promo", bundle_bonus: "gift", bundle_commit: "commit", auto_recharge: "commit", spend_threshold: "commit", enterprise_commit: "commit", other: "commit",
+};
+export function mapGrant(g: CreditGrantView): CreditGrant {
+  return { id: g.id, kind: KIND[g.kind], label: g.name || g.kind, amount: g.grantedEur, remaining: g.remainingEur, createdAt: g.startsAt ?? "", expiresAt: g.expiresAt, reference: g.reference };
 }
-const plusYears = (iso: string, y: number) => { const d = new Date(iso); d.setUTCFullYear(d.getUTCFullYear() + y); return d.toISOString(); };
 
-// ---------------------------------------------------------------------------
-// Constructores de cuerpos (puros; se prueban en tests/metronome-bodies.test.ts)
-// ---------------------------------------------------------------------------
-
-export function buildCustomerBody(input: SignupInput & { appUserId: string }): Metronome.V1.CustomerCreateParams {
-  if (!input.stripeCustomerId) throw new Error("Falta el cliente de Stripe: completa primero Stripe Checkout (modo setup).");
+export function mapInvoice(i: InvoiceView): Invoice {
+  const status: Invoice["status"] = i.status === "DRAFT" ? "draft" : i.status === "VOID" ? "void" : i.stripeStatus && !/paid/i.test(i.stripeStatus) ? "pending" : "paid";
+  const kindOf = (t: string) => (t === "usage" ? "usage" : t === "subscription" ? "fee" : t === "applied_commit_or_credit" ? "credit" : t === "commit_purchase" ? "commit" : undefined);
   return {
-    name: input.name,
-    // Alias de ingesta: permite enviar eventos con nuestro id de usuario en customer_id.
-    ingest_aliases: [input.appUserId],
-    customer_billing_provider_configurations: [
-      {
-        billing_provider: "stripe",
-        delivery_method: "direct_to_billing_provider",
-        // Stripe necesita un método de pago por defecto en invoice_settings para charge_automatically
-        // (lo fijamos en /api/stripe/return): https://docs.metronome.com/integrations/invoice-integrations/stripe
-        configuration: { stripe_customer_id: input.stripeCustomerId, stripe_collection_method: "charge_automatically" },
-      },
-    ],
-  };
-}
-
-const overridesFor = (ids: MetronomeIds, plan: PlanId, startingAt: string): Metronome.V1.ContractCreateParams.Override[] =>
-  PLANS[plan].discount > 0
-    ? (Object.keys(METRICS) as MetricId[]).map(m => ({ starting_at: startingAt, type: "MULTIPLIER" as const, multiplier: round(1 - PLANS[plan].discount), product_id: ids.usageProducts[m] }))
-    : [];
-
-function subscriptionFor(ids: MetronomeIds, plan: PlanId, startingAt?: string) {
-  const product = ids.subscriptionProducts[plan];
-  if (PLANS[plan].monthlyFee <= 0) return [];
-  if (!product) throw new Error(`Falta el producto de suscripción de Metronome para el plan ${PLANS[plan].name}`);
-  return [{
-    name: `Plan ${PLANS[plan].name}`,
-    // El precio (29 € / 199 €) vive en la tarifa: product_id + billing_frequency deben existir en el rate card.
-    subscription_rate: { product_id: product, billing_frequency: "MONTHLY" as const },
-    collection_schedule: "ADVANCE" as const,
-    // Prorrateo con cobro inmediato (BILL_IMMEDIATELY solo es válido con ADVANCE).
-    proration: { is_prorated: true, invoice_behavior: "BILL_IMMEDIATELY" as const },
-    initial_quantity: 1,
-    ...(startingAt ? { starting_at: startingAt } : {}),
-  }];
-}
-
-function recurringCreditFor(ids: MetronomeIds, plan: PlanId, startingAt: string) {
-  const p = PLANS[plan];
-  return {
-    name: `Créditos mensuales ${p.name}`,
-    product_id: ids.recurringCreditProduct,
-    access_amount: { unit_price: money(p.monthlyCredits), quantity: 1, credit_type_id: ids.creditTypeId },
-    priority: PRIORITY.recurring,
-    applicable_product_ids: usageOnly(ids),
-    commit_duration: { value: 1, unit: "PERIODS" as const }, // caducan cada mes: no se acumulan
-    recurrence_frequency: "MONTHLY" as const,
-    starting_at: startingAt,
-    // proration por defecto (FIRST_AND_LAST): el primer mes parcial (alta o subida a mitad de ciclo) se prorratea,
-    // igual que en metronome-setup. rollover_fraction = 1 solo actúa en transiciones de contrato.
-    rollover_fraction: 1,
-  };
-}
-
-export function buildContractBody(ids: MetronomeIds, args: { customerId: string; plan: PlanId; appUserId: string; startingAt: string; transitionFrom?: string; autoRecharge?: boolean }): Metronome.V1.ContractCreateParams {
-  scale = ids.amountScale;
-  const { customerId, plan, startingAt } = args;
-  const common = {
-    customer_id: customerId,
-    starting_at: startingAt,
-    uniqueness_key: `nebula-${args.appUserId}-${plan}-${startingAt}`,
-    billing_provider_configuration: { billing_provider: "stripe" as const, delivery_method: "direct_to_billing_provider" as const },
-    ...(args.transitionFrom ? { transition: { type: "RENEWAL" as const, from_contract_id: args.transitionFrom } } : {}),
-  };
-  const pkg = ids.packages[plan];
-  if (pkg) {
-    // Variante con plantillas de plan como "packages" (si el setup las crea).
-    // TODO(verificar): qué campos admite create junto a package_id ("only customer_id, starting_at, package_id, uniqueness_key..."):
-    //   https://docs.metronome.com/api-reference/contracts/create-a-contract
-    return { customer_id: customerId, starting_at: startingAt, package_id: pkg, uniqueness_key: common.uniqueness_key, ...(args.transitionFrom ? { transition: common.transition } : {}) };
-  }
-  const subs = subscriptionFor(ids, plan);
-  return {
-    ...common,
-    name: `nebula.ai · ${PLANS[plan].name}`,
-    rate_card_id: ids.rateCardId,
-    usage_statement_schedule: { frequency: "MONTHLY", day: "FIRST_OF_MONTH" },
-    ...(subs.length ? { subscriptions: subs } : {}),
-    recurring_credits: [recurringCreditFor(ids, plan, startingAt)],
-    overrides: overridesFor(ids, plan, startingAt),
-    multiplier_override_prioritization: "LOWEST_MULTIPLIER", // aplica siempre el mayor descuento vigente
-    ...(ids.fromSetup ? { custom_fields: { nebula_plan: plan } } : {}),
-    // Al cambiar de plan se conserva la recarga automática si el plan nuevo la permite.
-    ...(args.autoRecharge && PLANS[plan].autoRechargeAllowed ? { prepaid_balance_threshold_configuration: thresholdConfig(ids) } : {}),
-  };
-}
-
-export function buildBundleEdit(ids: MetronomeIds, args: { customerId: string; contractId: string; bundle: BundleId; now?: Date }): Metronome.V2.ContractEditParams {
-  scale = ids.amountScale;
-  const b = BUNDLES[args.bundle];
-  const start = hourFloor(args.now);
-  const ct = { credit_type_id: ids.creditTypeId };
-  return {
-    customer_id: args.customerId,
-    contract_id: args.contractId,
-    uniqueness_key: `bundle-${args.contractId}-${randomUUID()}`,
-    add_commits: [{
-      type: "PREPAID",
-      name: `Commit prepagado ${eur(b.price)}`,
-      product_id: ids.prepaidCommitProduct,
-      priority: PRIORITY.commit,
-      applicable_product_ids: usageOnly(ids),
-      rollover_fraction: 1, // el saldo comprado sobrevive a los cambios de plan (transiciones)
-      ...(ids.fromSetup ? { custom_fields: { nebula_bundle: args.bundle } } : {}),
-      access_schedule: { ...ct, schedule_items: [{ amount: money(b.price), starting_at: start, ending_before: plusYears(start, 1) }] },
-      invoice_schedule: { ...ct, schedule_items: [{ amount: money(b.price), timestamp: start }] },
-      // Metronome cobra al momento en Stripe (PaymentIntent) y solo libera el saldo si el pago se completa.
-      payment_gate_config: { payment_gate_type: "STRIPE", tax_type: "NONE", stripe_config: { payment_type: "PAYMENT_INTENT" } },
-    }],
-  };
-}
-
-export function buildGiftEdit(ids: MetronomeIds, args: { customerId: string; contractId: string; bundle: BundleId; now?: Date }): Metronome.V2.ContractEditParams | null {
-  scale = ids.amountScale;
-  const b = BUNDLES[args.bundle];
-  const gift = b.credit - b.price;
-  if (gift <= 0) return null;
-  const start = hourFloor(args.now);
-  return {
-    customer_id: args.customerId,
-    contract_id: args.contractId,
-    uniqueness_key: `gift-${args.contractId}-${randomUUID()}`,
-    add_credits: [{
-      name: `Saldo de regalo (${eur(gift)})`,
-      product_id: ids.giftCreditProduct,
-      priority: PRIORITY.gift,
-      applicable_product_ids: usageOnly(ids),
-      rollover_fraction: 1,
-      ...(ids.fromSetup ? { custom_fields: { nebula_bundle: args.bundle } } : {}),
-      access_schedule: { credit_type_id: ids.creditTypeId, schedule_items: [{ amount: money(gift), starting_at: start, ending_before: plusYears(start, 1) }] },
-    }],
-  };
-}
-
-/** Recarga automática: "si el saldo baja de 10 €, recargar hasta 10 € + 50 €". */
-export function thresholdConfig(ids: MetronomeIds) {
-  scale = ids.amountScale;
-  const b = BUNDLES[AUTO_RECHARGE.bundle];
-  return {
-    is_enabled: true,
-    threshold_amount: money(AUTO_RECHARGE.threshold),
-    // Metronome "recarga hasta" un saldo objetivo (no compra un bundle fijo): el commit creado es
-    // recharge_to_amount - saldo actual. Mínimos documentados: umbral ≥ 5 y recharge_to ≥ umbral + 10.
-    // Se toma de auto_recharge.recharge_to_eur del fichero de IDs (metronome-setup usa 50 → commit ≈ 40 €);
-    // sin fichero, 60 € (≈ commit de 50 €, como el bundle del catálogo). También METRONOME_RECHARGE_TO_EUR.
-    recharge_to_amount: money(ids.rechargeToAmount),
-    commit: { product_id: ids.autoRechargeProduct, name: "Recarga automática", priority: PRIORITY.commit, applicable_product_ids: usageOnly(ids), rollover_fraction: 1 },
-    payment_gate_config: { payment_gate_type: "STRIPE" as const, tax_type: "NONE" as const, stripe_config: { payment_type: "PAYMENT_INTENT" as const } },
-    // El +10 % de regalo del bundle de 50 € se puede reproducir con discount_configuration (pagar 50/55 del saldo),
-    // pero está tras un feature flag de Metronome ("ff:threshold-billing-discounts").
-    // TODO(verificar) con Metronome que el flag está activo antes de poner threshold_discount=true.
-    ...(ids.thresholdDiscount ? { discount_configuration: { payment_fraction: round(b.price / b.credit) } } : {}),
-  };
-}
-
-export function buildIngestEvents(ids: MetronomeIds, customerKey: string, events: { metric: MetricId; quantity: number; ts?: string }[]): Metronome.V1.UsageIngestParams.Usage[] {
-  // Un evento por event_type (por defecto: nebula_llm_request con input/output tokens y
-  // nebula_image_generation con images), como define metronome-setup/src/config.ts (BILLABLE_METRICS).
-  const ts = events[0]?.ts ?? new Date().toISOString();
-  const byType = new Map<string, Record<string, number | string>>();
-  for (const e of events) {
-    const type = ids.eventTypes[e.metric];
-    const props = byType.get(type) ?? { model: "nebula-1" };
-    const key = ids.eventProperties[e.metric];
-    props[key] = (Number(props[key]) || 0) + e.quantity;
-    byType.set(type, props);
-  }
-  return [...byType].map(([event_type, properties]) => ({ transaction_id: randomUUID(), customer_id: customerKey, event_type, timestamp: ts, properties }));
-}
-
-// ---------------------------------------------------------------------------
-// Mapeo de respuestas de Metronome al tipo Account
-// ---------------------------------------------------------------------------
-
-type Balance = Metronome.V1.ContractListBalancesResponse;
-type MInvoice = Metronome.V1.Customers.Invoice;
-
-export function mapBalance(ids: MetronomeIds, b: Balance, at = new Date()): CreditGrant {
-  scale = ids.amountScale;
-  const items = b.access_schedule?.schedule_items ?? [];
-  const current = items.filter(i => new Date(i.starting_at) <= at && at < new Date(i.ending_before));
-  const amount = fromMoney((current.length ? current : items).reduce((s, i) => s + i.amount, 0));
-  const isCredit = b.type === "CREDIT";
-  const recurring = isCredit && "recurring_credit_id" in b && !!b.recurring_credit_id;
-  const kind: CreditGrant["kind"] = !isCredit ? "commit" : recurring || b.product.id === ids.recurringCreditProduct ? "recurring" : "gift";
-  return { id: b.id, kind, label: b.name || b.product.name, amount, remaining: fromMoney(b.balance), createdAt: ("created_at" in b && b.created_at) || items[0]?.starting_at || at.toISOString() };
-}
-
-export function mapInvoice(inv: MInvoice): Invoice {
-  const ext = inv.external_invoice;
-  const paid = ext?.external_status === "PAID";
-  const status: Invoice["status"] = inv.status === "DRAFT" ? "draft" : inv.status === "VOID" ? "void" : paid ? "paid" : "pending";
-  const lines: InvoiceLine[] = inv.line_items.map(l => ({
-    description: l.name,
-    quantity: l.quantity,
-    unitPrice: l.unit_price !== undefined ? l.unit_price / scale : undefined,
-    amount: fromMoney(l.total),
-    kind: l.type === "commit_purchase" ? "commit" : l.product_type === "SubscriptionProductListItem" ? "fee" : l.total < 0 ? "credit" : "usage",
-  }));
-  const type: Invoice["type"] = inv.type === "USAGE" ? "usage" : lines.some(l => l.kind === "commit") ? "commit" : "subscription";
-  const desc = inv.status === "DRAFT" ? "Uso del periodo (borrador)" : type === "usage" ? "Factura de uso" : lines[0]?.description ?? "Factura";
-  return {
-    id: inv.id, date: inv.issued_at ?? inv.start_timestamp ?? new Date().toISOString(), description: desc, amount: fromMoney(inv.total), status, type,
-    periodStart: inv.start_timestamp, periodEnd: inv.end_timestamp, lines, externalId: ext?.invoice_id ?? ext?.external_payment_id, pdfUrl: ext?.pdf_url,
+    id: i.id, date: i.issuedAt ?? i.periodEnd ?? i.periodStart ?? "", amount: i.totalEur, status,
+    description: i.type === "USAGE" ? (status === "draft" ? "Uso del periodo (borrador)" : "Factura de uso") : i.type === "SCHEDULED" ? "Cargo programado (commit/bundle)" : i.type,
+    type: i.type === "USAGE" ? "usage" : "commit", periodStart: i.periodStart, periodEnd: i.periodEnd,
+    lines: i.lines.map(l => ({ description: l.name, quantity: l.quantity, unitPrice: l.unitPriceEur, amount: l.totalEur, kind: kindOf(l.type) })),
+    externalId: i.stripeInvoiceId, pdfUrl: i.pdfUrl,
   };
 }
 
 export function dailyFrom(usage: UsageEvent[]): DailyUsage[] {
   const map = new Map<string, DailyUsage>();
-  for (const u of usage) {
-    const k = `${u.ts.slice(0, 10)}|${u.metric}`;
-    const r = map.get(k) ?? { day: u.ts.slice(0, 10), metric: u.metric, quantity: 0, cost: 0 };
-    r.quantity += u.quantity; r.cost = round(r.cost + u.cost);
-    map.set(k, r);
+  for (const e of usage) {
+    const k = `${e.ts.slice(0, 10)}|${e.metric}`;
+    const row = map.get(k) ?? { day: e.ts.slice(0, 10), metric: e.metric, quantity: 0, cost: 0 };
+    row.quantity += e.quantity;
+    row.cost = round(row.cost + e.cost);
+    map.set(k, row);
   }
   return [...map.values()].sort((a, b) => a.day.localeCompare(b.day));
 }
 
-// ---------------------------------------------------------------------------
-// Proveedor
-// ---------------------------------------------------------------------------
+/** Eventos de /v1/ingest para una petición: transaction_id = id de la petición de la app (sin fusionar peticiones). */
+export function buildIngestEvents(c: H.Ctx, customer: string, r: UsageRequest): H.IngestEvent[] {
+  const out: H.IngestEvent[] = [];
+  const hasText = (r.inputTokens ?? 0) > 0 || (r.outputTokens ?? 0) > 0;
+  const model = r.model ?? "nebula-1";
+  if (hasText) out.push(H.llmRequestEvent(c, { transactionId: r.requestId, customer, inputTokens: r.inputTokens ?? 0, outputTokens: r.outputTokens ?? 0, model, timestamp: r.ts }));
+  if ((r.images ?? 0) > 0) {
+    // Si una misma petición trae texto e imágenes son dos event_type distintos: sufijo determinista para el segundo.
+    out.push(H.imageGenerationEvent(c, { transactionId: hasText ? `${r.requestId}:images` : r.requestId, customer, images: r.images!, model, timestamp: r.ts }));
+  }
+  return out;
+}
+
+// ─────────────────────────── utilidades ───────────────────────────
 
 function mustLink(appUserId: string): CustomerLink {
   const l = getLink(appUserId);
@@ -286,227 +74,200 @@ function mustLink(appUserId: string): CustomerLink {
   return l;
 }
 
-function localAlert(link: CustomerLink, type: Alert["type"], message: string) {
-  addAlert(link.metronomeCustomerId, { id: `al_${randomUUID().slice(0, 8)}`, ts: new Date().toISOString(), type, message, source: "local" });
+function localAlert(key: string, type: Alert["type"], message: string, idSuffix: string) {
+  addAlert(key, { id: `loc_${idSuffix}`, ts: new Date().toISOString(), type, message, source: "local" });
 }
 
-/** Alertas de saldo bajo (20 %) y saldo a cero como threshold notifications de Metronome (llegan por webhook). */
-async function createBalanceAlerts(ids: MetronomeIds, link: CustomerLink) {
-  const plan = PLANS[link.plan];
-  const thresholds = [
-    { name: `Saldo bajo (20 %) · ${plan.name}`, amount: money(plan.monthlyCredits * LOW_BALANCE_RATIO) },
-    // metronome-setup ya crea una alerta GLOBAL de saldo 0 (sin customer_id); solo la creamos por cliente si no existe.
-    ...(ids.hasGlobalZeroAlert ? [] : [{ name: `Saldo agotado · ${plan.name}`, amount: 0 }]),
-  ];
-  // El umbral de low_remaining_contract_credit_and_commit_balance_reached es un IMPORTE, no un porcentaje:
-  // el 20 % se calcula aquí sobre los créditos del plan.
-  // TODO(verificar): si threshold 0 dispara al llegar a 0 o solo por debajo, y si conviene crear estas
-  //   notificaciones una vez por plan (sin customer_id + filtros) en vez de por cliente:
-  //   https://docs.metronome.com/guides/customers-billing/set-up-notifications/threshold-notifications
-  for (const t of thresholds) {
-    await client().v1.alerts.create({
-      alert_type: "low_remaining_contract_credit_and_commit_balance_reached",
-      name: t.name,
-      threshold: t.amount,
-      customer_id: link.metronomeCustomerId,
-      credit_type_id: ids.creditTypeId,
-      uniqueness_key: `low-${link.metronomeCustomerId}-${link.plan}-${t.amount}`,
-      evaluate_on_create: true,
-    });
-  }
-}
-
-async function listAllBalances(customerId: string) {
-  const out: Balance[] = [];
-  for await (const b of client().v1.contracts.listBalances({ customer_id: customerId, include_balance: true, include_contract_balances: true, covering_date: new Date().toISOString(), limit: 25 })) {
-    out.push(b);
-    if (out.length >= 100) break;
-  }
-  return out;
-}
-
-async function recentInvoices(customerId: string) {
-  const page = await client().v1.customers.invoices.list({ customer_id: customerId, limit: 20, sort: "date_desc" });
-  return page.data;
-}
-
-function resolvePending(link: CustomerLink): CustomerLink {
-  if (link.pendingPlan && Date.now() >= +new Date(link.pendingPlan.effectiveAt)) {
-    const l = { ...link, plan: link.pendingPlan.plan, metronomeContractId: link.pendingPlan.contractId, pendingPlan: undefined };
-    saveLink(l);
-    return l;
-  }
-  return link;
+/** Aplica una bajada programada cuando llega su fecha y re-sincroniza la alerta del 20 % del nuevo plan. */
+async function resolvePending(link: CustomerLink): Promise<CustomerLink> {
+  if (!link.pendingPlan || new Date(link.pendingPlan.effectiveAt) > new Date()) return link;
+  const next: CustomerLink = { ...link, plan: link.pendingPlan.plan, metronomeContractId: link.pendingPlan.contractId, pendingPlan: undefined };
+  saveLink(next);
+  await H.syncPlanLowBalanceAlert(ctx(), next.metronomeCustomerId, next.plan).catch(e => console.error("[metronome] syncPlanLowBalanceAlert:", e));
+  return next;
 }
 
 async function toAccount(link0: CustomerLink): Promise<Account> {
-  const link = resolvePending(link0);
-  const ids = idsNow();
-  const [balances, invoices, contract] = await Promise.all([
-    listAllBalances(link.metronomeCustomerId),
-    recentInvoices(link.metronomeCustomerId),
-    client().v2.contracts.retrieve({ customer_id: link.metronomeCustomerId, contract_id: link.metronomeContractId }),
+  const link = await resolvePending(link0);
+  const c = ctx();
+  const cid = link.metronomeCustomerId;
+  const [balances, invoices, contract, upcoming, usage30] = await Promise.all([
+    H.getBalanceSummary(c, cid),
+    H.listInvoices(c, cid),
+    H.getContract(c, cid, link.metronomeContractId),
+    H.getUpcomingInvoicePreview(c, cid, link.metronomeContractId).catch(() => undefined),
+    H.getUsageLast30Days(c, cid).catch(() => undefined),
   ]);
+  const summary = H.summarizeContract(contract, c.ids.amount_scale || 1);
   const plan = PLANS[link.plan];
-  const credits = balances.filter(b => b.type !== "POSTPAID").map(b => mapBalance(ids, b));
-  const bal = round(credits.reduce((s, c) => s + c.remaining, 0));
-  const mapped = invoices.map(mapInvoice);
-  const draft = mapped.find(i => i.status === "draft" && i.type === "usage");
+  const credits = balances.grants.filter(g => g.metronomeType !== "POSTPAID").map(mapGrant);
+  const bal = round(credits.reduce((s, x) => s + x.remaining, 0));
+  // El corte por webhook se levanta cuando vuelve a haber saldo (con 2 min de margen por el retraso de listBalances).
+  let accessCut = !!link.accessCut;
+  if (accessCut && bal > 0 && Date.now() - +new Date(link.accessCutAt ?? 0) > 120_000) { accessCut = false; saveLink({ ...link, accessCut: false }); }
   const usage = read(db => db.usage[link.appUserId] ?? []);
-  const { start, end } = utcMonth();
+  const daily = dailyFrom(usage);
+  const u30 = usage30 ?? usageLast30DaysFromDaily(cid, daily);
+  const usageDue = upcoming ? upcoming.lines.filter(l => l.type !== "subscription").reduce((s, l) => s + l.totalEur, 0) : 0;
+  const now = new Date();
   return {
-    customerId: link.appUserId,
-    name: link.name,
-    email: link.email,
-    plan: link.plan,
+    customerId: link.appUserId, name: link.name, email: link.email, plan: link.plan,
     pendingPlan: link.pendingPlan ? { plan: link.pendingPlan.plan, effectiveAt: link.pendingPlan.effectiveAt } : undefined,
     cardSaved: !!link.stripeCustomerId,
-    autoRecharge: !!contract.data.prepaid_balance_threshold_configuration?.is_enabled,
-    blocked: !plan.overage && bal <= 0,
-    overageAccrued: plan.overage && draft ? Math.max(0, draft.amount) : 0,
-    credits,
-    usage: usage.slice(0, 500),
-    daily: dailyFrom(usage),
-    invoices: mapped,
-    alerts: getAlerts(link.metronomeCustomerId),
-    periodStart: start,
-    periodEnd: end,
+    autoRecharge: !!summary.autoRecharge?.enabled,
+    spendThreshold: summary.spendThreshold,
+    blocked: !plan.overage && (bal <= 0 || accessCut),
+    accessCut,
+    overageAccrued: plan.overage ? Math.max(0, round(usageDue)) : 0,
+    credits, usage: usage.slice(0, 500), daily,
+    invoices: invoices.map(mapInvoice),
+    alerts: getAlerts(cid),
+    periodStart: upcoming?.periodStart ?? new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1)).toISOString(),
+    periodEnd: upcoming?.periodEnd ?? H.nextPeriodStart(summary.billingAnchorDate ?? contract.starting_at),
     mode: "metronome",
+    upcoming, usage30: u30, recommendation: recommendPlan(u30, link.plan),
   };
 }
 
+// ─────────────────────────── acciones disparadas por webhooks ───────────────────────────
+
+/** Webhook de saldo 0 (alerta global del setup) → corta el acceso en Free/Pro; Scale sigue (overage). */
+export function setAccessCutLive(metronomeCustomerId: string, cut: boolean) {
+  const link = findLinkByMetronomeId(metronomeCustomerId);
+  if (!link) return false;
+  const effective = cut && !PLANS[link.plan].overage;
+  saveLink({ ...link, accessCut: effective, accessCutAt: effective ? new Date().toISOString() : link.accessCutAt });
+  return true;
+}
+
+/**
+ * payment_gate.payment_status (workflow manual_commit). El webhook trae customer_id + contract_id + invoice_id, NO el id
+ * de compra: se recorren las compras pendientes del cliente y, para cada purchaseId, se comprueba con findBundleCommit
+ * (custom field nebula_purchase_id) si el commit existe. Solo entonces se concede el bonus (uniqueness_key por compra).
+ * Si el pago falló, las compras cuyo commit no existe se marcan como fallidas (Metronome no crea el commit ni reintenta).
+ */
+export async function confirmBundlePaymentsLive(metronomeCustomerId: string, paid: boolean) {
+  const c = ctx();
+  const done: string[] = [];
+  for (const p of pendingPurchases(metronomeCustomerId)) {
+    const commit = await H.findBundleCommit(c, metronomeCustomerId, p.purchaseId);
+    if (paid && commit) {
+      await H.grantBundleBonus(c, { customerId: metronomeCustomerId, contractId: commit.contract?.id ?? p.contractId, bundle: p.bundle, purchaseId: p.purchaseId });
+      resolvePurchase(p.purchaseId, "bonus_granted");
+      done.push(p.purchaseId);
+    } else if (!commit && (!paid || Date.now() - +new Date(p.createdAt) > 24 * 3600_000)) {
+      resolvePurchase(p.purchaseId, "failed");
+      done.push(p.purchaseId);
+    }
+  }
+  return done;
+}
+
+// ─────────────────────────── proveedor ───────────────────────────
+
 export const metronomeBilling: BillingProvider = {
   mode: "metronome",
-
   async signup(input) {
-    const ids = idsNow();
-    const appUserId = `usr_${randomUUID().replace(/-/g, "").slice(0, 16)}`;
-    // 1) Cliente en Metronome enlazado al cliente de Stripe.
-    const customer = await client().v1.customers.create(buildCustomerBody({ ...input, appUserId }));
-    // 2) Contrato del plan sobre la tarifa: suscripción + créditos recurrentes + overrides de descuento.
-    const contract = await client().v1.contracts.create(buildContractBody(ids, { customerId: customer.data.id, plan: input.plan, appUserId, startingAt: hourFloor() }));
+    if (!input.stripeCustomerId) throw new Error("Falta el cliente de Stripe: completa primero Stripe Checkout (modo setup).");
+    const appUserId = appUserIdFor(input.stripeCustomerId);
+    const existing = getLink(appUserId);
+    if (existing) return toAccount(existing); // retorno de Checkout repetido
+    const c = ctx();
+    const customer = await H.createCustomerWithStripe(c, { name: input.name, ingestAlias: appUserId, stripeCustomerId: input.stripeCustomerId });
+    const contractId = await H.createPlanContract(c, {
+      customerId: customer.metronomeCustomerId, plan: input.plan, spendThreshold: input.plan === "scale",
+      uniquenessKey: `nebula-signup-${customer.metronomeCustomerId}`, // una sola alta por cliente, aunque se reintente
+    });
     const link: CustomerLink = {
       appUserId, name: input.name, email: input.email, plan: input.plan,
-      metronomeCustomerId: customer.data.id, metronomeContractId: contract.data.id, stripeCustomerId: input.stripeCustomerId,
+      metronomeCustomerId: customer.metronomeCustomerId, metronomeContractId: contractId, stripeCustomerId: input.stripeCustomerId,
       createdAt: new Date().toISOString(),
     };
     saveLink(link);
-    // 3) Alertas de saldo (webhooks alerts.low_remaining_contract_credit_and_commit_balance_reached).
-    await createBalanceAlerts(ids, link).catch(e => console.error("[metronome] no se pudieron crear las alertas:", e));
-    localAlert(link, "info", `Cuenta creada en el plan ${PLANS[input.plan].name}. Tarjeta guardada en Stripe.`);
+    await H.syncPlanLowBalanceAlert(c, link.metronomeCustomerId, link.plan).catch(e => console.error("[metronome] alerta 20 %:", e));
+    localAlert(link.metronomeCustomerId, "info", `Cuenta creada en el plan ${PLANS[input.plan].name}. Tarjeta guardada en Stripe.`, `signup_${appUserId}`);
     return toAccount(link);
   },
-
   async get(appUserId) {
     const link = getLink(appUserId);
     return link ? toAccount(link) : null;
   },
-
   async getInvoice(appUserId, invoiceId) {
     const link = mustLink(appUserId);
-    const r = await client().v1.customers.invoices.retrieve({ customer_id: link.metronomeCustomerId, invoice_id: invoiceId });
-    return mapInvoice(r.data);
+    try { return mapInvoice(await H.getInvoice(ctx(), link.metronomeCustomerId, invoiceId)); } catch { return null; }
   },
-
   async changePlan(appUserId, plan) {
-    // Cambio de plan = CONTRATO NUEVO con transition RENEWAL desde el actual, como recomienda Metronome
-    // (termina la suscripción anterior e inicia la nueva en una sola llamada, prorratea las subidas y
-    // aplica el rollover de commits/créditos): https://docs.metronome.com/guides/pricing-packaging/subscription/manage-subscription-lifecycle
-    // Mismo enfoque que metronome-setup/src/helpers/contracts.ts (changePlan).
-    //  - Subida: empieza AHORA (redondeado a la hora); la cuota nueva se cobra prorrateada al momento (ADVANCE).
-    //  - Bajada: empieza el día 1 del mes siguiente (Metronome solo prorratea subidas).
-    const ids = idsNow();
-    const link = resolvePending(mustLink(appUserId));
-    if (link.plan === plan) return toAccount(link);
-    const isUpgrade = PLANS[plan].monthlyFee > PLANS[link.plan].monthlyFee;
-    const current = (await client().v2.contracts.retrieve({ customer_id: link.metronomeCustomerId, contract_id: link.metronomeContractId })).data;
-    const autoRecharge = !!current.prepaid_balance_threshold_configuration?.is_enabled;
-    const startingAt = isUpgrade ? hourFloor() : utcMonth().end;
-    // TODO(verificar): con rollover_fraction = 1 el saldo restante de los créditos del plan anterior también pasa
-    //   al contrato nuevo (el modo simulado solo añade la diferencia prorrateada). Si no se quiere, usar 0 en los
-    //   créditos recurrentes: https://docs.metronome.com/guides/pricing-packaging/apply-credits-and-commits/create-a-pre-paid-commit
-    const next = await client().v1.contracts.create(buildContractBody(ids, {
-      customerId: link.metronomeCustomerId, plan, appUserId, startingAt, transitionFrom: link.metronomeContractId, autoRecharge,
-    }));
-    if (isUpgrade) {
-      const l: CustomerLink = { ...link, plan, metronomeContractId: next.data.id, pendingPlan: undefined };
-      saveLink(l);
-      await createBalanceAlerts(ids, l).catch(e => console.error("[metronome] alertas del nuevo plan:", e));
-      localAlert(l, "info", `Plan cambiado a ${PLANS[plan].name}. La cuota se cobra prorrateada y los créditos del mes se prorratean.`);
-      return toAccount(l);
+    const link = await resolvePending(mustLink(appUserId));
+    if (!PLANS[plan]) throw new Error("Plan desconocido");
+    if (link.plan === plan && link.pendingPlan) {
+      // TODO(verificar): cancelar una bajada programada = archivar el contrato futuro (POST /v1/contracts/archive) y
+      // quitar el ending_before del actual. No está en los helpers del setup; pendiente de confirmar con Metronome.
+      throw new Error("Para cancelar una bajada ya programada, contacta con soporte.");
     }
-    const l: CustomerLink = { ...link, pendingPlan: { plan, effectiveAt: startingAt, contractId: next.data.id } };
-    saveLink(l);
-    localAlert(l, "info", `Cambio a ${PLANS[plan].name} programado para el ${new Date(startingAt).toLocaleDateString("es-ES", { timeZone: "UTC" })}.`);
-    return toAccount(l);
+    const c = ctx();
+    const r = await H.changePlan(c, link.metronomeCustomerId, plan);
+    if (r.kind === "upgrade" && r.newContractId) {
+      saveLink({ ...link, plan, metronomeContractId: r.newContractId, pendingPlan: undefined, accessCut: false });
+      // Archiva la alerta del 20 % del plan anterior y crea la del nuevo (evaluate_on_create).
+      await H.syncPlanLowBalanceAlert(c, link.metronomeCustomerId, plan).catch(e => console.error("[metronome] alerta 20 %:", e));
+      localAlert(link.metronomeCustomerId, "info", `Plan cambiado a ${PLANS[plan].name}. Tu saldo anterior se conserva.`, `plan_${r.newContractId}`);
+    } else if (r.kind === "downgrade" && r.newContractId) {
+      saveLink({ ...link, pendingPlan: { plan, effectiveAt: r.effectiveAt, contractId: r.newContractId } });
+      localAlert(link.metronomeCustomerId, "info", `Bajada a ${PLANS[plan].name} programada para el ${new Date(r.effectiveAt).toLocaleDateString("es-ES", { timeZone: "UTC" })}. Conservarás bundles, regalos y promociones.`, `plan_${r.newContractId}`);
+    }
+    return toAccount(getLink(appUserId)!);
   },
-
-  async buyBundle(appUserId, bundle) {
-    const ids = idsNow();
+  async buyBundle(appUserId, bundle, purchaseId) {
     const link = mustLink(appUserId);
-    if (!BUNDLES[bundle]) throw new Error("Bundle desconocido");
-    await client().v2.contracts.edit(buildBundleEdit(ids, { customerId: link.metronomeCustomerId, contractId: link.metronomeContractId, bundle }));
-    // El regalo se concede cuando llega el webhook payment_gate.payment_status = paid (ver webhooks/metronome).
-    if (BUNDLES[bundle].credit > BUNDLES[bundle].price) {
-      tx(db => { db.pendingGifts.push({ id: randomUUID(), contractId: link.metronomeContractId, bundle, createdAt: new Date().toISOString() }); });
+    if (!getPurchase(purchaseId)) {
+      addPurchase({ purchaseId, customerKey: link.metronomeCustomerId, contractId: link.metronomeContractId, bundle, status: "payment_pending", createdAt: new Date().toISOString() });
     }
-    localAlert(link, "info", `Pago de ${eur(BUNDLES[bundle].price)} iniciado en Stripe. El saldo se libera al confirmarse el pago.`);
+    // Commit con payment gate: Metronome cobra en Stripe al momento; el bonus llega con el webhook de pago.
+    await H.buyBundle(ctx(), { customerId: link.metronomeCustomerId, contractId: link.metronomeContractId, bundle, purchaseId });
     return toAccount(link);
   },
-
   async setAutoRecharge(appUserId, enabled) {
-    const ids = idsNow();
     const link = mustLink(appUserId);
-    if (enabled && !PLANS[link.plan].autoRechargeAllowed) throw new Error("La recarga automática solo está disponible en Pro y Scale");
-    const c = (await client().v2.contracts.retrieve({ customer_id: link.metronomeCustomerId, contract_id: link.metronomeContractId })).data;
-    const base = { customer_id: link.metronomeCustomerId, contract_id: link.metronomeContractId, uniqueness_key: `autorecharge-${link.metronomeContractId}-${enabled}-${Date.now()}` };
-    if (c.prepaid_balance_threshold_configuration) {
-      await client().v2.contracts.edit({ ...base, update_prepaid_balance_threshold_configuration: { is_enabled: enabled } });
-    } else if (enabled) {
-      await client().v2.contracts.edit({ ...base, add_prepaid_balance_threshold_configuration: thresholdConfig(ids) });
-    }
+    await H.setAutoRecharge(ctx(), link.metronomeCustomerId, link.metronomeContractId, enabled);
     return toAccount(link);
   },
-
-  async ingest(appUserId, events) {
-    const ids = idsNow();
+  async setSpendThreshold(appUserId, enabled) {
+    const link = mustLink(appUserId);
+    await H.setSpendThreshold(ctx(), link.metronomeCustomerId, link.metronomeContractId, enabled);
+    return toAccount(link);
+  },
+  async redeemPromo(appUserId, rawCode) {
+    const link = mustLink(appUserId);
+    const code = rawCode.trim().toUpperCase();
+    const promo = PROMOTIONS[code];
+    if (!promo) throw new Error("Código promocional no válido");
+    const r = await H.grantPromoCredit(ctx(), { customerId: link.metronomeCustomerId, contractId: link.metronomeContractId, code, label: promo.label, amountEur: promo.amount, validDays: promo.validDays });
+    localAlert(link.metronomeCustomerId, "info", `Código ${code} canjeado: ${eur(r.amountEur)} de crédito hasta el ${new Date(r.expiresAt).toLocaleDateString("es-ES", { timeZone: "UTC" })}.`, `promo_${code}`);
+    return toAccount(link);
+  },
+  async ingest(appUserId, requests) {
     const link = mustLink(appUserId);
     const plan = PLANS[link.plan];
-    // Free/Pro: sin saldo no se acepta uso. Metronome no bloquea por sí mismo, lo decide la app.
-    // TODO(verificar): los saldos de Metronome se actualizan con cierto retraso tras la ingesta, así que puede
-    //   colarse algo de uso por encima de 0. Para cortar en tiempo real haría falta un contador local o
-    //   escuchar el webhook de saldo a 0.
+    // Corte duro Free/Pro (lo hace la app; Metronome no bloquea): webhook de saldo 0 + consulta del saldo neto.
     if (!plan.overage) {
-      const balances = await listAllBalances(link.metronomeCustomerId);
-      const bal = balances.filter(b => b.type !== "POSTPAID").reduce((s, b) => s + (b.balance ?? 0), 0);
-      if (bal <= 0) return { account: await toAccount(link), rejected: true };
+      if (link.accessCut) return { account: await toAccount(link), rejected: true, duplicates: 0 };
+      const net = await H.getNetBalanceEur(ctx(), link.metronomeCustomerId);
+      if (net <= 0) return { account: await toAccount(link), rejected: true, duplicates: 0 };
     }
-    const valid = events.filter(e => e.metric in METRICS && e.quantity > 0);
-    if (valid.length) {
-      await client().v1.usage.ingest({ usage: buildIngestEvents(ids, appUserId /* alias de ingesta */, valid) });
-      const ts = valid[0].ts ?? new Date().toISOString();
-      tx(db => {
-        const list = (db.usage[appUserId] ??= []);
-        // Coste estimado localmente con el catálogo (solo para la gráfica; la cifra buena es la de Metronome).
-        for (const e of valid) list.unshift({ id: `ev_${randomUUID().slice(0, 8)}`, ts, metric: e.metric, quantity: e.quantity, cost: usageCost(e.metric, e.quantity, plan.discount) });
-        db.usage[appUserId] = list.slice(0, 2000);
-      });
-    }
-    return { account: await toAccount(link), rejected: false };
+    const valid = requests.filter(r => r.requestId);
+    const fresh = new Set(claimRequestIds(appUserId, valid.map(r => r.requestId)));
+    const todo = valid.filter(r => fresh.has(r.requestId));
+    const c = ctx();
+    await H.ingest(c, todo.flatMap(r => buildIngestEvents(c, appUserId, r)));
+    // Copia local (coste estimado a precio de plan) solo para gráficas y listados.
+    const local: UsageEvent[] = todo.flatMap(r => {
+      const ts = r.ts ?? new Date().toISOString();
+      const parts: [MetricId, number][] = [["input_tokens", r.inputTokens ?? 0], ["output_tokens", r.outputTokens ?? 0], ["images", r.images ?? 0]];
+      return parts.filter(([, q]) => q > 0).map(([metric, quantity]) => ({ id: `${r.requestId}:${metric}`, requestId: r.requestId, ts, metric, quantity, cost: usageCost(metric, quantity, plan.discount) }));
+    });
+    tx(db => { db.usage[appUserId] = [...local, ...(db.usage[appUserId] ?? [])].slice(0, 5000); });
+    return { account: await toAccount(link), rejected: false, duplicates: valid.length - todo.length };
   },
 };
 
-/** Concede el saldo de regalo pendiente cuando Stripe confirma el pago de un commit (webhook). */
-export async function releasePendingGift(contractId: string) {
-  const ids = idsNow();
-  const pending = tx(db => {
-    const i = db.pendingGifts.findIndex(g => g.contractId === contractId);
-    return i >= 0 ? db.pendingGifts.splice(i, 1)[0] : null;
-  });
-  if (!pending) return false;
-  const link = read(db => Object.values(db.links).find(l => l.metronomeContractId === contractId || l.pendingPlan?.contractId === contractId));
-  if (!link) return false;
-  const body = buildGiftEdit(ids, { customerId: link.metronomeCustomerId, contractId, bundle: pending.bundle });
-  if (body) await client().v2.contracts.edit(body);
-  return true;
-}
+export { METRICS };

@@ -1,104 +1,127 @@
-// Configuración de IDs de Metronome para el modo en vivo.
-// Fuente principal: fichero JSON generado por el script de setup del experto de Metronome
-//   ruta = $METRONOME_IDS_FILE  ||  ../metronome-setup/metronome-ids.json (relativa al cwd)
-// Si falta un valor en el fichero se usa la variable de entorno equivalente (ver .env.example).
-// El lector es tolerante con varias formas de clave (p. ej. products.usage.input_tokens o
-// products.input_tokens) para poder reconciliar con el formato final del script sin tocar código.
+// IDs de Metronome para el modo en vivo, en el formato EXACTO de metronome-ids.json del setup del experto
+// (/workspace/metronome-setup/src/ids.ts → type MetronomeIds). Los helpers (metronome-helpers.ts) usan
+// ctx.ids.products.fixed.bundle_commit, ctx.ids.credit_types.EUR, etc., igual que los del setup.
+//   Ruta: $METRONOME_IDS_FILE || ../metronome-setup/metronome-ids.json (relativa al cwd de la web).
+//   Si no hay fichero, se construye el mismo objeto a partir de variables de entorno (ver .env.example).
 import fs from "node:fs";
 import path from "node:path";
-import type { MetricId, PlanId } from "../catalog";
+import { AUTO_RECHARGE, BUNDLES, PLANS, SPEND_THRESHOLD, type MetricId, type PlanId } from "../catalog";
 
+export type FixedProductKey = "plan_credits" | "bundle_commit" | "bundle_bonus" | "auto_recharge" | "spend_threshold" | "promo_credit" | "enterprise_commit";
+export type SubscriptionPlanKey = Exclude<PlanId, "free">;
+
+/** = MetronomeIds de metronome-setup/src/ids.ts */
 export type MetronomeIds = {
-  source: string; // de dónde se leyó (para diagnóstico)
-  creditTypeId: string; // tipo de crédito fiat EUR (obligatorio: sin él Metronome asume USD)
-  rateCardId: string;
-  eventTypes: Record<MetricId, string>; // event_type de /v1/ingest por métrica
-  eventProperties: Record<MetricId, string>;
-  usageProducts: Record<MetricId, string>;
-  subscriptionProducts: Partial<Record<PlanId, string>>; // Free no tiene cuota
-  recurringCreditProduct: string;
-  giftCreditProduct: string;
-  prepaidCommitProduct: string;
-  autoRechargeProduct: string; // producto del commit que crea la recarga automática (por defecto, el del bundle)
-  amountScale: number; // EUR = 1 (unidades enteras); USD = 100 (céntimos)
-  rechargeToAmount: number; // "recargar hasta" en euros
-  fromSetup: boolean; // el fichero lo generó metronome-setup (custom fields registrados)
-  hasGlobalZeroAlert: boolean; // el setup ya crea la alerta global de saldo 0
-  packages: Partial<Record<PlanId, string>>; // opcional: plantillas de plan como "packages" de Metronome
-  thresholdDiscount: boolean; // aplicar discount_configuration a la recarga automática (feature flag en Metronome)
-};
-
-type Json = Record<string, unknown>;
-const get = (o: unknown, p: string): unknown => p.split(".").reduce<unknown>((acc, k) => (acc && typeof acc === "object" ? (acc as Json)[k] : undefined), o);
-const pick = (o: unknown, ...paths: string[]) => {
-  for (const p of paths) { const v = get(o, p); if (typeof v === "string" && v) return v; if (v && typeof v === "object" && typeof (v as Json).id === "string") return (v as Json).id as string; }
-  return undefined;
+  generated_at: string;
+  base_url: string;
+  dry_run: boolean;
+  credit_types: { EUR: string };
+  billable_metrics: Record<MetricId, string>;
+  products: { usage: Record<MetricId, string>; subscription: Record<SubscriptionPlanKey, string>; fixed: Record<FixedProductKey, string> };
+  rate_card: { id: string; alias: string };
+  alerts: { zero_balance?: string; zero_balance_uniqueness_key: string };
+  event_types: Record<MetricId, string>;
+  event_properties: Record<MetricId, string>;
+  auto_recharge: { threshold_eur: number; recharge_to_eur: number };
+  spend_threshold: { scale_threshold_eur: number };
+  amount_scale: number;
+  catalog: {
+    plans: Record<PlanId, { monthly_fee_eur: number; monthly_credits_eur: number; usage_multiplier: number; subscription_product_id?: string }>;
+    bundles: Record<string, { paid_eur: number; bonus_eur: number }>;
+  };
+  /** Solo en la web: de dónde se leyó (diagnóstico). */
+  _source?: string;
 };
 
 export function idsFilePath() {
   return process.env.METRONOME_IDS_FILE || path.resolve(process.cwd(), "..", "metronome-setup", "metronome-ids.json");
 }
 
-let cache: { mtime: number; ids: MetronomeIds } | null = null;
+const FIXED_ENV: Record<FixedProductKey, string> = {
+  plan_credits: "METRONOME_PRODUCT_PLAN_CREDITS",
+  bundle_commit: "METRONOME_PRODUCT_BUNDLE_COMMIT",
+  bundle_bonus: "METRONOME_PRODUCT_BUNDLE_BONUS",
+  auto_recharge: "METRONOME_PRODUCT_AUTO_RECHARGE",
+  spend_threshold: "METRONOME_PRODUCT_SPEND_THRESHOLD",
+  promo_credit: "METRONOME_PRODUCT_PROMO_CREDIT",
+  enterprise_commit: "METRONOME_PRODUCT_ENTERPRISE_COMMIT",
+};
+const METRIC_ENV: Record<MetricId, string> = { input_tokens: "INPUT_TOKENS", output_tokens: "OUTPUT_TOKENS", images: "IMAGES" };
+
+function fromEnv(e: NodeJS.ProcessEnv): MetronomeIds {
+  const m = <T>(f: (k: MetricId) => T) => ({ input_tokens: f("input_tokens"), output_tokens: f("output_tokens"), images: f("images") });
+  return {
+    generated_at: "", base_url: e.METRONOME_BASE_URL ?? "https://api.metronome.com", dry_run: false,
+    credit_types: { EUR: e.METRONOME_CREDIT_TYPE_ID ?? "" },
+    billable_metrics: m(k => e[`METRONOME_METRIC_${METRIC_ENV[k]}`] ?? ""),
+    products: {
+      usage: m(k => e[`METRONOME_PRODUCT_${METRIC_ENV[k]}`] ?? ""),
+      subscription: { pro: e.METRONOME_PRODUCT_SUBSCRIPTION_PRO ?? "", scale: e.METRONOME_PRODUCT_SUBSCRIPTION_SCALE ?? "" },
+      fixed: Object.fromEntries(Object.entries(FIXED_ENV).map(([k, v]) => [k, e[v] ?? ""])) as Record<FixedProductKey, string>,
+    },
+    rate_card: { id: e.METRONOME_RATE_CARD_ID ?? "", alias: "nebula_eur" },
+    alerts: { zero_balance: e.METRONOME_ZERO_BALANCE_ALERT_ID, zero_balance_uniqueness_key: "nebula-zero-balance-eur-v1" },
+    event_types: { input_tokens: "nebula_llm_request", output_tokens: "nebula_llm_request", images: "nebula_image_generation" },
+    event_properties: { input_tokens: "input_tokens", output_tokens: "output_tokens", images: "images" },
+    auto_recharge: { threshold_eur: AUTO_RECHARGE.threshold, recharge_to_eur: AUTO_RECHARGE.rechargeTo },
+    spend_threshold: { scale_threshold_eur: SPEND_THRESHOLD.scaleThreshold },
+    amount_scale: Number(e.METRONOME_AMOUNT_SCALE ?? 1) || 1,
+    catalog: {
+      plans: Object.fromEntries((Object.keys(PLANS) as PlanId[]).map(k => [k, { monthly_fee_eur: PLANS[k].monthlyFee, monthly_credits_eur: PLANS[k].monthlyCredits, usage_multiplier: 1 - PLANS[k].discount }])) as MetronomeIds["catalog"]["plans"],
+      bundles: Object.fromEntries(Object.values(BUNDLES).map(b => [b.id, { paid_eur: b.price, bonus_eur: b.credit - b.price }])),
+    },
+  };
+}
+
+/** Comprueba que están los IDs imprescindibles; devuelve la lista de claves que faltan. */
+export function missingIds(ids: MetronomeIds): string[] {
+  const miss: string[] = [];
+  if (!ids.credit_types?.EUR) miss.push("credit_types.EUR");
+  if (!ids.rate_card?.id) miss.push("rate_card.id");
+  for (const k of ["input_tokens", "output_tokens", "images"] as MetricId[]) {
+    if (!ids.products?.usage?.[k]) miss.push(`products.usage.${k}`);
+    if (!ids.billable_metrics?.[k]) miss.push(`billable_metrics.${k}`);
+  }
+  for (const k of ["pro", "scale"] as SubscriptionPlanKey[]) if (!ids.products?.subscription?.[k]) miss.push(`products.subscription.${k}`);
+  for (const k of Object.keys(FIXED_ENV) as FixedProductKey[]) if (!ids.products?.fixed?.[k]) miss.push(`products.fixed.${k}`);
+  return miss;
+}
+
+let cache: { key: string; ids: MetronomeIds } | null = null;
 
 export function loadMetronomeIds(): MetronomeIds {
   const file = idsFilePath();
-  let json: unknown = {};
+  let fileIds: Partial<MetronomeIds> | undefined;
   let mtime = 0;
   try {
     mtime = fs.statSync(file).mtimeMs;
-    if (cache && cache.mtime === mtime) return cache.ids;
-    json = JSON.parse(fs.readFileSync(file, "utf8"));
-  } catch {
-    json = {};
-  }
-  const e = process.env;
-  const req = (name: string, v: string | undefined) => {
-    if (!v) throw new Error(`Falta configuración de Metronome: ${name} (en ${file} o en variables de entorno)`);
-    return v;
-  };
-  const metric = (m: MetricId, envName: string) =>
-    pick(json, `products.usage.${m}`, `products.${m}`, `usage_products.${m}`, `product_ids.${m}`) ?? e[envName];
+    if (cache && cache.key === `${file}:${mtime}`) return cache.ids;
+    fileIds = JSON.parse(fs.readFileSync(file, "utf8"));
+  } catch { fileIds = undefined; }
+  const env = fromEnv(process.env);
+  // Fusión superficial por secciones: el fichero manda; las variables de entorno rellenan huecos.
+  const f = fileIds ?? {};
   const ids: MetronomeIds = {
-    source: mtime ? file : "variables de entorno",
-    creditTypeId: req("credit_types.EUR / METRONOME_CREDIT_TYPE_ID", pick(json, "credit_types.EUR", "credit_type_id", "credit_types.eur", "credit_type.eur", "fiat_credit_type_id", "eur_credit_type_id") ?? e.METRONOME_CREDIT_TYPE_ID),
-    rateCardId: req("rate_card_id / METRONOME_RATE_CARD_ID", pick(json, "rate_card_id", "rate_card", "rate_cards.default") ?? e.METRONOME_RATE_CARD_ID),
-    // Por defecto, los del setup: nebula_llm_request {input_tokens, output_tokens} y nebula_image_generation {images}.
-    eventTypes: {
-      input_tokens: pick(json, "event_types.input_tokens", "event_types.llm_request") ?? e.METRONOME_EVENT_TYPE_LLM ?? "nebula_llm_request",
-      output_tokens: pick(json, "event_types.output_tokens", "event_types.llm_request") ?? e.METRONOME_EVENT_TYPE_LLM ?? "nebula_llm_request",
-      images: pick(json, "event_types.images", "event_types.image_generation") ?? e.METRONOME_EVENT_TYPE_IMAGES ?? "nebula_image_generation",
+    ...env, ...f,
+    credit_types: { EUR: f.credit_types?.EUR || env.credit_types.EUR },
+    billable_metrics: { ...env.billable_metrics, ...f.billable_metrics },
+    products: {
+      usage: { ...env.products.usage, ...f.products?.usage },
+      subscription: { ...env.products.subscription, ...f.products?.subscription },
+      fixed: { ...env.products.fixed, ...f.products?.fixed },
     },
-    eventProperties: {
-      input_tokens: pick(json, "event_properties.input_tokens", "events.properties.input_tokens") ?? "input_tokens",
-      output_tokens: pick(json, "event_properties.output_tokens", "events.properties.output_tokens") ?? "output_tokens",
-      images: pick(json, "event_properties.images", "events.properties.images") ?? "images",
-    },
-    usageProducts: {
-      input_tokens: req("products.usage.input_tokens / METRONOME_PRODUCT_INPUT_TOKENS", metric("input_tokens", "METRONOME_PRODUCT_INPUT_TOKENS")),
-      output_tokens: req("products.usage.output_tokens / METRONOME_PRODUCT_OUTPUT_TOKENS", metric("output_tokens", "METRONOME_PRODUCT_OUTPUT_TOKENS")),
-      images: req("products.usage.images / METRONOME_PRODUCT_IMAGES", metric("images", "METRONOME_PRODUCT_IMAGES")),
-    },
-    subscriptionProducts: {
-      pro: pick(json, "products.subscription.pro", "products.subscriptions.pro", "plans.pro.subscription_product_id") ?? e.METRONOME_PRODUCT_SUBSCRIPTION_PRO,
-      scale: pick(json, "products.subscription.scale", "products.subscriptions.scale", "plans.scale.subscription_product_id") ?? e.METRONOME_PRODUCT_SUBSCRIPTION_SCALE,
-    },
-    recurringCreditProduct: req("products.recurring_credit / METRONOME_PRODUCT_RECURRING_CREDIT", pick(json, "products.fixed.plan_credits", "products.recurring_credit", "products.monthly_credit", "products.credits.recurring") ?? e.METRONOME_PRODUCT_RECURRING_CREDIT),
-    giftCreditProduct: req("products.gift_credit / METRONOME_PRODUCT_GIFT_CREDIT", pick(json, "products.fixed.bundle_bonus", "products.gift_credit", "products.bonus_credit", "products.credits.gift") ?? e.METRONOME_PRODUCT_GIFT_CREDIT),
-    prepaidCommitProduct: req("products.prepaid_commit / METRONOME_PRODUCT_PREPAID_COMMIT", pick(json, "products.fixed.bundle_commit", "products.prepaid_commit", "products.commit", "products.bundle_commit", "products.credits.commit") ?? e.METRONOME_PRODUCT_PREPAID_COMMIT),
-    autoRechargeProduct: "",
-    amountScale: Number(get(json, "amount_scale") ?? e.METRONOME_AMOUNT_SCALE ?? 1) || 1,
-    rechargeToAmount: Number(get(json, "auto_recharge.recharge_to_eur") ?? e.METRONOME_RECHARGE_TO_EUR ?? 60) || 60,
-    fromSetup: typeof get(json, "generated_at") === "string",
-    hasGlobalZeroAlert: !!(pick(json, "alerts.zero_balance") || pick(json, "alerts.zero_balance_uniqueness_key")),
-    packages: {
-      free: pick(json, "plans.free.package_id", "packages.free") ?? e.METRONOME_PACKAGE_FREE,
-      pro: pick(json, "plans.pro.package_id", "packages.pro") ?? e.METRONOME_PACKAGE_PRO,
-      scale: pick(json, "plans.scale.package_id", "packages.scale") ?? e.METRONOME_PACKAGE_SCALE,
-    },
-    thresholdDiscount: get(json, "threshold_discount") === true || e.METRONOME_THRESHOLD_DISCOUNT === "1",
+    rate_card: { ...env.rate_card, ...f.rate_card },
+    alerts: { ...env.alerts, ...f.alerts },
+    event_types: { ...env.event_types, ...f.event_types },
+    event_properties: { ...env.event_properties, ...f.event_properties },
+    auto_recharge: { ...env.auto_recharge, ...f.auto_recharge },
+    spend_threshold: { ...env.spend_threshold, ...f.spend_threshold },
+    amount_scale: Number(f.amount_scale ?? env.amount_scale) || 1,
+    _source: fileIds ? file : "variables de entorno",
   };
-  ids.autoRechargeProduct = pick(json, "products.fixed.auto_recharge", "products.auto_recharge") ?? e.METRONOME_PRODUCT_AUTO_RECHARGE ?? ids.prepaidCommitProduct;
-  cache = { mtime, ids };
+  if (ids.dry_run) throw new Error(`${file} es de un dry-run (IDs de ejemplo). Ejecuta el setup real: cd ../metronome-setup && npm run setup`);
+  const miss = missingIds(ids);
+  if (miss.length) throw new Error(`Falta configuración de Metronome: ${miss.join(", ")} (en ${file} o en variables de entorno)`);
+  cache = { key: `${file}:${mtime}`, ids };
   return ids;
 }
