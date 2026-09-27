@@ -5,6 +5,8 @@ import Guard from "@/components/Guard";
 import { eur } from "@/lib/catalog";
 import type { Invoice } from "@/lib/billing/types";
 import type { AccountView } from "@/components/useAccount";
+import { UnbillableBadge } from "@/components/BillableBadge";
+import { UNBILLABLE_TOOLTIP } from "@/lib/billing/types";
 
 const STATUS: Record<Invoice["status"], { label: string; cls: string }> = {
   paid: { label: "Paid", cls: "ok" }, pending: { label: "Payment pending", cls: "warn" }, draft: { label: "Draft (closes at month end)", cls: "" }, void: { label: "Void", cls: "bad" }, failed: { label: "Payment failed", cls: "bad" },
@@ -32,8 +34,9 @@ function Detail({ id, a }: { id: string; a: AccountView }) {
             <div className="logo">nebula<span>.ai</span></div>
             <div className="muted" style={{ fontSize: 13 }}>{inv.status === "draft" ? "Provisional invoice" : "Invoice"} · {inv.id}</div>
           </div>
-          <span className={`badge ${st.cls}`}>{st.label}</span>
+          <span>{(inv.billableStatus !== "unbillable" || inv.status === "draft") && <span className={`badge ${st.cls}`}>{st.label}</span>} <UnbillableBadge invoice={inv} /></span>
         </div>
+        {inv.billableStatus === "unbillable" && <p className="muted" style={{ fontSize: 13, marginTop: 12 }}>{UNBILLABLE_TOOLTIP}</p>}
         {inv.status === "failed" && <div className="banner bad" role="alert" style={{ marginTop: 16 }}>Payment failed: we couldn&apos;t charge your card for this invoice. Please check your payment method; our team has been notified.</div>}
         <div className="grid g3" style={{ margin: "20px 0" }}>
           <div><div className="label">Customer</div>{a.name}<div className="muted" style={{ fontSize: 13 }}>{a.email}</div></div>

@@ -47,6 +47,11 @@ export const BUNDLES: Record<BundleId, { id: BundleId; price: number; credit: nu
 
 /** Recarga automática = prepaid_balance_threshold_configuration: si el saldo baja de 10 €, recargar HASTA 50 € (sin regalo). */
 export const AUTO_RECHARGE = { threshold: 10, rechargeTo: 50, validityMonths: 12 };
+/** Condiciones del commit de recarga (van DENTRO de `commit`; a nivel superior la API responde 200 pero las ignora). */
+/** Auto-recharge only on plans with autoRechargeAllowed (Pro and Scale), never Free: checked in the UI, the API route and both providers. */
+export const AUTO_RECHARGE_PLANS_ERROR = "Auto-recharge is only available on Pro and Scale";
+export const isAutoRechargeAllowed = (plan: string) => plan in PLANS && PLANS[plan as PlanId].autoRechargeAllowed;
+export const AUTO_RECHARGE_COMMIT_TERMS = { duration: { value: AUTO_RECHARGE.validityMonths, unit: "MONTHS" as "DAYS" | "WEEKS" | "MONTHS" | "YEARS" }, rolloverFraction: 1, rateType: "LIST_RATE" as "LIST_RATE" | "COMMIT_RATE" };
 /** Scale: spend_threshold_configuration. Cada vez que el gasto extra del periodo llega a 300 €, se cobra por adelantado. */
 export const SPEND_THRESHOLD = { scaleThreshold: 300 };
 export const LOW_BALANCE_RATIO = 0.2;

@@ -6,7 +6,7 @@
 //  - bundles = commit con payment gate; el regalo se concede solo tras el webhook payment_gate.payment_status=paid;
 //  - recarga automática "hasta 50 €" (Free/Pro/Scale), cobro anticipado por umbral de gasto (Scale), promos con caducidad;
 //  - alertas del 20 % (por plan) y de 0 €, corte de acceso en Free/Pro; ingesta idempotente por id de petición.
-import { AUTO_RECHARGE, BUNDLES, LOW_BALANCE_RATIO, METRICS, PLANS, PROMOTIONS, SPEND_THRESHOLD, eur, type BundleId, type MetricId, type PlanId } from "../catalog";
+import { AUTO_RECHARGE, AUTO_RECHARGE_PLANS_ERROR, BUNDLES, LOW_BALANCE_RATIO, METRICS, PLANS, PROMOTIONS, SPEND_THRESHOLD, eur, type BundleId, type MetricId, type PlanId } from "../catalog";
 import { addPlanEvent, addPurchase, getAccount, getAlerts, getPurchase, pendingPurchases, resolvePurchase, saveAccount, tx } from "../store";
 import { coversWorstCase, capAlerts, capMessage, fitsCap, normalizeCap, periodSpend, requestCost } from "./limits";
 import { recommendPlan, round2, usageLast30DaysFromDaily } from "./insights";
@@ -141,13 +141,26 @@ export function closePeriods(a: Account, at = nowMs()): boolean {
   let guard = 0;
   while (at >= +new Date(a.periodEnd) && guard++ < 24) {
     changed = true;
-    const closedStart = a.periodStart, closedEnd = a.periodEnd;
+    const closedStart = a.periodStart, closedEnd = a.periodEnd, closedPlan = a.plan;
     const due = round(a.overageAccrued - (a.spendPrepaid ?? 0));
     if (a.overageAccrued > 0) {
       charge(a, `Overage for ${fmtDay(closedStart)} – ${fmtDay(addDays(closedEnd, -1))}`, Math.max(0, due), "usage", [
         { description: "Usage not covered by credits", amount: a.overageAccrued, kind: "usage" },
         ...(a.spendPrepaid ? [{ description: "Early threshold charges already paid", amount: -a.spendPrepaid, kind: "credit" as const }] : []),
       ], { date: closedEnd, periodStart: closedStart, periodEnd: closedEnd });
+    }
+    else if (closedPlan === "free") {
+      // Like Metronome: the Free usage invoice is €0 (fully covered by credits, never overage) and is marked
+      // billable_status "unbillable", so it isn't sent to Stripe. Recorded so the UI label can be demoed.
+      const used = round((a.daily ?? []).filter(d => d.day >= closedStart.slice(0, 10) && d.day < closedEnd.slice(0, 10)).reduce((s, d) => s + d.cost, 0));
+      a.invoices.unshift({
+        id: id("in"), date: closedEnd, description: `Free usage for ${fmtDay(closedStart)} – ${fmtDay(addDays(closedEnd, -1))}`, amount: 0, status: "paid", type: "usage",
+        periodStart: closedStart, periodEnd: closedEnd, billableStatus: "unbillable",
+        lines: [
+          { description: "Usage at list price", amount: used, kind: "usage" },
+          ...(used > 0 ? [{ description: "Free credits applied", amount: -used, kind: "credit" as const }] : []),
+        ],
+      });
     }
     a.overageAccrued = 0;
     a.spendPrepaid = 0;
@@ -196,6 +209,7 @@ export function draftInvoice(a: Account): Invoice {
   return {
     id: "draft-current", date: nowIso(), description: `Usage this period (draft)`, amount: round(Math.max(0, a.overageAccrued - (a.spendPrepaid ?? 0))), status: "draft", type: "usage",
     periodStart: a.periodStart, periodEnd: a.periodEnd, lines,
+    // No billable_status on the draft: live, a Free €0 DRAFT reads "billable"; only closed €0 Free invoices are marked.
   };
 }
 
@@ -416,7 +430,7 @@ export const mockBilling: BillingProvider = {
   },
   async setAutoRecharge(customerId, enabled) {
     const a = load(customerId);
-    if (enabled && !PLANS[a.plan].autoRechargeAllowed) throw new Error("Auto-recharge is only available on Pro and Scale");
+    if (enabled && !PLANS[a.plan].autoRechargeAllowed) throw new Error(AUTO_RECHARGE_PLANS_ERROR);
     if (enabled && a.spendThreshold?.enabled) throw new Error("Turn off the early threshold charge first (they can't be combined)");
     a.autoRecharge = enabled;
     if (enabled) evaluate(a, balance(a));

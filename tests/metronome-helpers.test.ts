@@ -74,6 +74,59 @@ describe.skipIf(!hasSetup)("parity with the setup helpers (dry-run-helpers.txt)"
     expect(H.llmRequestEvent(ctx, { transactionId: llm.transaction_id, customer: llm.customer_id, inputTokens: llm.properties.input_tokens, outputTokens: llm.properties.output_tokens, model: llm.properties.model, timestamp: llm.timestamp })).toEqual(llm);
     expect(H.imageGenerationEvent(ctx, { transactionId: img.transaction_id, customer: img.customer_id, images: img.properties.images, model: img.properties.model, timestamp: img.timestamp })).toEqual(img);
   });
+  // Cliente falso: registra las llamadas (como el dry-run del setup) y devuelve contratos simulados.
+  const fake = (contract: Record<string, unknown>, newId = "33333333-3333-4333-8333-333333333333") => {
+    const calls: { op: string; body: any }[] = [];
+    const client = {
+      v1: { contracts: { create: async (body: any) => { calls.push({ op: "create", body }); return { data: { id: newId } }; } } },
+      v2: { contracts: {
+        list: async (body: any) => { calls.push({ op: "list", body }); return { data: [contract] }; },
+        retrieve: async (body: any) => { calls.push({ op: "get", body }); return { data: contract }; },
+        edit: async (body: any) => { calls.push({ op: "edit", body }); return { data: { id: body.contract_id } }; },
+      } },
+    } as unknown as Metronome;
+    return { ctx: { client, ids }, calls };
+  };
+  const proWithAR = (commit?: object) => ({ id: CONTRACT, customer_id: CUSTOMER, starting_at: "2026-09-03T10:00:00.000Z", custom_fields: { nebula_plan: "pro" }, usage_statement_schedule: { frequency: "MONTHLY", billing_anchor_date: "2026-09-03T10:00:00.000Z" }, prepaid_balance_threshold_configuration: { is_enabled: true, threshold_amount: 10, recharge_to_amount: 50, ...(commit ? { commit } : {}) } });
+
+  it("3a: upgrade at next hour is created WITHOUT threshold config and returns pendingThresholdConfig", async () => {
+    const { ctx: c, calls } = fake(proWithAR(), post("3a", "/v2/contracts/get").contract_id);
+    const res = await H.changePlan(c, CUSTOMER, "scale", { now: new Date("2026-09-25T18:22:00Z"), upgradeStart: "next_hour" });
+    const created = calls.find(x => x.op === "create")!.body;
+    expect(created).toEqual(post("3a", "/v1/contracts/create"));
+    expect(created.prepaid_balance_threshold_configuration).toBeUndefined();
+    expect(created.spend_threshold_configuration).toBeUndefined();
+    expect(res).toMatchObject({ kind: "upgrade", effectiveAt: "2026-09-25T19:00:00.000Z", pendingThresholdConfig: "auto_recharge" });
+    // Antes de empezar: no llama a la API. Después: GET y, como el contrato simulado ya tiene config, no edita (igual que el dry-run).
+    expect(await H.finishPendingThresholdConfig(c, CUSTOMER, res, new Date("2026-09-25T18:59:00Z"))).toEqual({ done: false, applied: false, retryAt: "2026-09-25T19:00:00.000Z" });
+    const n = calls.length;
+    expect(await H.finishPendingThresholdConfig(c, CUSTOMER, res, new Date("2026-09-25T19:05:00Z"))).toEqual({ done: true, applied: false });
+    expect(calls.slice(n).map(x => [x.op, x.body])).toEqual([["get", post("3a", "/v2/contracts/get")]]);
+  });
+  it("3a: once started and missing, finishPendingThresholdConfig adds the auto-recharge config (with commit terms)", async () => {
+    const { ctx: c, calls } = fake({ id: "33333333-3333-4333-8333-333333333333", customer_id: CUSTOMER, starting_at: "2026-09-25T19:00:00.000Z", custom_fields: { nebula_plan: "scale" } });
+    const r = await H.finishPendingThresholdConfig(c, CUSTOMER, { newContractId: "33333333-3333-4333-8333-333333333333", effectiveAt: "2026-09-25T19:00:00.000Z", pendingThresholdConfig: "auto_recharge" }, new Date("2026-09-25T19:05:00Z"));
+    expect(r).toEqual({ done: true, applied: true });
+    const edit = calls.find(x => x.op === "edit")!.body;
+    expect(edit.add_prepaid_balance_threshold_configuration).toEqual(post("2b", "/v1/contracts/create").prepaid_balance_threshold_configuration);
+    expect(edit.add_prepaid_balance_threshold_configuration.commit).toMatchObject({ duration: { value: 12, unit: "MONTHS" }, rollover_fraction: 1, rate_type: "LIST_RATE" });
+  });
+  it("5: auto-recharge disable / enable (update_ carries the commit terms inside commit)", async () => {
+    const { ctx: c, calls } = fake(proWithAR());
+    await H.setAutoRecharge(c, CUSTOMER, CONTRACT, false);
+    await H.setAutoRecharge(c, CUSTOMER, CONTRACT, true);
+    const edits = calls.filter(x => x.op === "edit").map(x => x.body);
+    expect(edits).toEqual([post("5", "/v2/contracts/edit", 0), post("5", "/v2/contracts/edit", 1)]);
+  });
+  it("5b: sync only the recharge-commit terms (no is_enabled); no-op when already up to date", async () => {
+    const { ctx: c, calls } = fake(proWithAR());
+    await H.syncAutoRechargeCommitTerms(c, CUSTOMER, CONTRACT);
+    expect(calls.map(x => [x.op, x.body])).toEqual([["get", post("5b", "/v2/contracts/get")], ["edit", post("5b", "/v2/contracts/edit")]]);
+    // La API devuelve duration.value como string: se normaliza con Number() y no se re-edita.
+    const up = fake(proWithAR({ duration: { value: "12", unit: "MONTHS" }, rollover_fraction: 1, rate_type: "LIST_RATE" }));
+    expect(await H.buildAutoRechargeCommitTermsEdit(up.ctx, CUSTOMER, CONTRACT)).toBeUndefined();
+    expect(H.summarizeContract(proWithAR({ duration: { value: "12", unit: "MONTHS" }, rollover_fraction: 1, rate_type: "LIST_RATE" }) as any).autoRecharge).toMatchObject({ commitDuration: { value: 12, unit: "MONTHS" }, rolloverFraction: 1, rateType: "LIST_RATE" });
+  });
   it("30-day usage: window at UTC midnight and the 3 metrics", () => {
     const want = post("12", "/v1/usage");
     const got = H.buildUsageLast30DaysBody(ctx, CUSTOMER, new Date(new Date(want.ending_before).getTime() - 3600_000));

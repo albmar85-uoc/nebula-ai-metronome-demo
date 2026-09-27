@@ -13,6 +13,9 @@ export type CustomerLink = {
   email: string;
   plan: PlanId;
   pendingPlan?: { plan: PlanId; effectiveAt: string; contractId: string };
+  /** Live: threshold billing (auto-recharge / spend threshold) still to be added to a contract that starts in the future
+   *  (the API rejects it before the start with 400). Finished lazily by finishPendingThreshold (reads and usage). */
+  pendingThreshold?: { contractId: string; effectiveAt: string; kind: "auto_recharge" | "spend_threshold" };
   accessCut?: boolean; // webhook de saldo 0 (Free/Pro) o pago de umbral fallido; se levanta al confirmarse un pago
   accessCutAt?: string;
   metronomeCustomerId: string;

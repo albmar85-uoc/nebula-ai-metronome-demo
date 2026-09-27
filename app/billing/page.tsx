@@ -9,6 +9,7 @@ import SpendThresholdNotice from "@/components/SpendThresholdNotice";
 import SpendCapForm from "@/components/SpendCapForm";
 import { AUTO_RECHARGE, BUNDLES, PLANS, PROMOTIONS, SPEND_THRESHOLD, eur, type BundleId, type PlanId } from "@/lib/catalog";
 import type { Invoice } from "@/lib/billing/types";
+import { UnbillableBadge } from "@/components/BillableBadge";
 
 const STATUS: Record<Invoice["status"], { label: string; cls: string }> = {
   paid: { label: "paid", cls: "ok" }, pending: { label: "pending", cls: "warn" }, draft: { label: "draft", cls: "" }, void: { label: "void", cls: "bad" }, failed: { label: "payment failed", cls: "bad" },
@@ -75,7 +76,7 @@ function Billing({ a }: { a: AccountView }) {
             </div>
           ))}
           <div className="row" style={{ marginTop: 16 }}>
-            <div className="sp"><b>Auto-recharge</b> {a.autoRecharge && <span className="badge ok">on</span>}<div className="muted" style={{ fontSize: 13 }}>We top your balance up to {eur(AUTO_RECHARGE.rechargeTo)} whenever it drops below {eur(AUTO_RECHARGE.threshold)}, charging only the difference (no gift).{!cur.autoRechargeAllowed && " Available on Pro and Scale."}{a.spendThreshold?.enabled && " Can't be combined with the early threshold charge."}</div></div>
+            <div className="sp"><b>Auto-recharge</b> {a.autoRecharge && <span className="badge ok">on</span>}<div className="muted" style={{ fontSize: 13 }}>We top your balance up to {eur(AUTO_RECHARGE.rechargeTo)} whenever it drops below {eur(AUTO_RECHARGE.threshold)}, charging only the difference (no gift). <span data-testid="ar-terms">Each top-up is valid for {AUTO_RECHARGE.validityMonths} months and carries over in full when you change plans.</span>{a.thresholdPending?.kind === "auto_recharge" && <> <b data-testid="ar-pending">Switches on with your new plan at {new Date(a.thresholdPending.effectiveAt).toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit", timeZone: "UTC" })} UTC.</b></>}{!cur.autoRechargeAllowed && " Available on Pro and Scale."}{a.spendThreshold?.enabled && " Can't be combined with the early threshold charge."}</div></div>
             <button className="btn small" aria-label={a.autoRecharge ? "Turn off auto-recharge" : "Turn on auto-recharge"} disabled={!cur.autoRechargeAllowed || !!busy || (!a.autoRecharge && !!a.spendThreshold?.enabled)} onClick={() => run("ar", "/api/autorecharge", { enabled: !a.autoRecharge })}>{a.autoRecharge ? "Turn off" : "Turn on"}</button>
           </div>
           {a.plan === "scale" && (
@@ -100,7 +101,7 @@ function Billing({ a }: { a: AccountView }) {
               <tr key={i.id} className="clickable">
                 <td><Link tabIndex={-1} aria-hidden="true" href={`/billing/invoices/${encodeURIComponent(i.id)}`}>{new Date(i.date).toLocaleString("en-US", { dateStyle: "short", timeStyle: "short" })}</Link></td>
                 <td><Link href={`/billing/invoices/${encodeURIComponent(i.id)}`}>{i.description}</Link></td>
-                <td style={{ textAlign: "right", whiteSpace: "nowrap" }}>{eur(i.amount)} <span className={`badge ${STATUS[i.status].cls}`}>{STATUS[i.status].label}</span></td>
+                <td style={{ textAlign: "right", whiteSpace: "nowrap" }}>{eur(i.amount)} {(i.billableStatus !== "unbillable" || i.status === "draft") && <span className={`badge ${STATUS[i.status].cls}`}>{STATUS[i.status].label}</span>} <UnbillableBadge invoice={i} /></td>
               </tr>))}</tbody></table></div>
           <p className="muted" style={{ fontSize: 13 }}>Select an invoice to see the details.</p>
         </div>

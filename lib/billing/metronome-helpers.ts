@@ -3,7 +3,7 @@
 // cuerpo contra los tipos generados del OpenAPI). Si el experto cambia un helper, replicar el cambio aquí.
 // Tabla helper → endpoint → método del SDK: README del setup, sección 5.
 import Metronome from "@metronome/sdk";
-import { AUTO_RECHARGE, BUNDLES, LOW_BALANCE_RATIO, PLANS, PRIORITIES, SPEND_THRESHOLD, type BundleId, type MetricId, type PlanId } from "../catalog";
+import { AUTO_RECHARGE, AUTO_RECHARGE_COMMIT_TERMS, AUTO_RECHARGE_PLANS_ERROR, BUNDLES, LOW_BALANCE_RATIO, PLANS, PRIORITIES, SPEND_THRESHOLD, type BundleId, type MetricId, type PlanId } from "../catalog";
 import { round2 } from "./insights";
 import type { MetronomeIds, SubscriptionPlanKey } from "./metronome-config";
 import type {
@@ -88,13 +88,20 @@ export function buildPrepaidBalanceThresholdConfig(ctx: Ctx, enabled = true) {
       name: "Auto-recharge",
       priority: PRIORITIES.autoRecharge,
       applicable_product_tags: [USAGE_TAG],
-      // `duration` y `rollover_fraction` están en la spec oficial (PrepaidBalanceThresholdCommit, https://docs.metronome.com/openapi.json)
-      // y en el setup, pero NO en las typings de @metronome/sdk 3.10.0 → se añaden fuera del tipo; el SDK envía el cuerpo tal cual.
-      // Verified live (sandbox, 2026-09-25): accepted and stored as duration {value:"12",unit:"MONTHS"}, rollover_fraction 1.
-      ...({ duration: { value: AUTO_RECHARGE.validityMonths, unit: "MONTHS" }, rollover_fraction: 1 } as object),
+      // `duration`, `rollover_fraction` y `rate_type` van DENTRO de `commit` (a nivel superior: 200 pero se ignoran). No están en
+      // las typings de @metronome/sdk 3.10.0 → cast estrecho; el SDK envía el cuerpo tal cual.
+      // Verified live (sandbox): stored as duration {value:"12",unit:"MONTHS"}, rollover_fraction 1, rate_type LIST_RATE.
+      ...(buildAutoRechargeCommitTerms() as object),
     },
     payment_gate_config: STRIPE_PAYMENT_INTENT_GATE,
   } satisfies Metronome.V1.ContractCreateParams["prepaid_balance_threshold_configuration"];
+}
+
+export type AutoRechargeCommitTerms = { duration: { value: number; unit: string }; rollover_fraction: number; rate_type: string };
+
+/** Condiciones del commit de cada recarga: 12 meses de validez, se traspasa íntegro (rollover 1) en cambios de plan, a precio de lista. */
+export function buildAutoRechargeCommitTerms(terms = AUTO_RECHARGE_COMMIT_TERMS): AutoRechargeCommitTerms {
+  return { duration: { value: terms.duration.value, unit: terms.duration.unit }, rollover_fraction: terms.rolloverFraction, rate_type: terms.rateType };
 }
 
 export function buildSpendThresholdConfig(ctx: Ctx, enabled = true, thresholdEur = ctx.ids.spend_threshold?.scale_threshold_eur ?? SPEND_THRESHOLD.scaleThreshold) {
@@ -208,7 +215,7 @@ export type ContractV2 = {
   id: string; customer_id: string; starting_at: string; ending_before?: string | null; archived_at?: string | null; uniqueness_key?: string | null;
   custom_fields?: Record<string, string>;
   usage_statement_schedule?: { frequency: string; billing_anchor_date: string };
-  prepaid_balance_threshold_configuration?: { is_enabled: boolean; threshold_amount: number; recharge_to_amount: number } | null;
+  prepaid_balance_threshold_configuration?: { is_enabled: boolean; threshold_amount: number; recharge_to_amount: number; commit?: { duration?: { value: string | number; unit: string }; rollover_fraction?: number; rate_type?: string } } | null;
   spend_threshold_configuration?: { is_enabled: boolean; threshold_amount: number; payment_gate_config?: { payment_gate_type: string } } | null;
 };
 
@@ -229,7 +236,14 @@ export function summarizeContract(c: ContractV2, scale = 1): PlanContractSummary
   return {
     contractId: c.id, customerId: c.customer_id, plan, startingAt: c.starting_at, endingBefore: c.ending_before ?? undefined,
     billingAnchorDate: c.usage_statement_schedule?.billing_anchor_date,
-    autoRecharge: pb ? ({ enabled: pb.is_enabled, thresholdEur: pb.threshold_amount / scale, rechargeToEur: pb.recharge_to_amount / scale } satisfies AutoRechargeState) : undefined,
+    autoRecharge: pb
+      ? ({
+          enabled: pb.is_enabled, thresholdEur: pb.threshold_amount / scale, rechargeToEur: pb.recharge_to_amount / scale,
+          commitDuration: pb.commit?.duration ? { value: Number(pb.commit.duration.value), unit: pb.commit.duration.unit as NonNullable<AutoRechargeState["commitDuration"]>["unit"] } : undefined,
+          rolloverFraction: pb.commit?.rollover_fraction,
+          rateType: pb.commit?.rate_type as AutoRechargeState["rateType"],
+        } satisfies AutoRechargeState)
+      : undefined,
     spendThreshold: st ? ({ enabled: st.is_enabled, thresholdEur: st.threshold_amount / scale, paymentGate: (st.payment_gate_config?.payment_gate_type ?? "NONE") as SpendThresholdState["paymentGate"] } satisfies SpendThresholdState) : undefined,
   };
 }
@@ -252,6 +266,51 @@ export function upgradeStartAt(mode: "floor" | "next_hour", now = new Date()) {
   const floor = floorToHour(now);
   return mode === "next_hour" ? new Date(new Date(floor).getTime() + 3600_000).toISOString() : floor;
 }
+// ───────────────────────────── manual balance entries ─────────────────────────────
+
+/**
+ * Deterministic uniqueness key for a manual balance entry, in the same scheme as the rest of the adapter
+ * (nebula-bundle-<purchaseId>, nebula-promo-<customer>-<code>, nebula-signup-<customer>): one key per business
+ * operation id, so a retry (double click, timeout, webhook redelivery) can never apply the same adjustment twice.
+ */
+export function manualBalanceEntryKey(p: { customerId: string; balanceId: string; operationId: string }) {
+  return `nebula-manual-${p.customerId}-${p.balanceId}-${p.operationId}`.slice(0, 128);
+}
+
+export type ManualBalanceEntryInput = {
+  customerId: string; contractId?: string; balanceId: string; segmentId: string;
+  amountEur: number; reason: string; operationId: string; timestamp?: string;
+};
+
+export function buildManualBalanceEntry(ctx: Ctx, p: ManualBalanceEntryInput) {
+  return {
+    customer_id: p.customerId,
+    ...(p.contractId ? { contract_id: p.contractId } : {}),
+    id: p.balanceId,
+    segment_id: p.segmentId,
+    amount: amt(ctx, p.amountEur),
+    reason: p.reason,
+    ...(p.timestamp ? { timestamp: p.timestamp } : {}),
+    uniqueness_key: manualBalanceEntryKey({ customerId: p.customerId, balanceId: p.balanceId, operationId: p.operationId }),
+  };
+}
+
+/**
+ * POST /v1/contracts/addManualBalanceLedgerEntry. `uniqueness_key` is accepted by the API since 2026-08-18 but is not in
+ * the @metronome/sdk 3.10.0 typings, so it is passed through this single narrow cast (the SDK sends the body as is).
+ * 409 = this operation id was already applied → treated as success (idempotent retry).
+ */
+export async function addManualBalanceEntry(ctx: Ctx, p: ManualBalanceEntryInput): Promise<{ applied: boolean; uniquenessKey: string }> {
+  const body = buildManualBalanceEntry(ctx, p);
+  try {
+    await ctx.client.v1.contracts.addManualBalanceEntry(body as Metronome.V1.ContractAddManualBalanceEntryParams & { uniqueness_key: string });
+    return { applied: true, uniquenessKey: body.uniqueness_key };
+  } catch (e) {
+    if (isConflict(e)) return { applied: false, uniquenessKey: body.uniqueness_key };
+    throw e;
+  }
+}
+
 /** Archive a Metronome customer, only if its Metronome name starts with "Nebula demo" (never touches other customers). */
 export async function archiveDemoCustomer(ctx: Ctx, customerId: string) {
   const c = (await ctx.client.v1.customers.retrieve({ customer_id: customerId })).data;
@@ -270,12 +329,34 @@ export async function changePlan(ctx: Ctx, customerId: string, newPlan: PlanId, 
   const anchor = summary.billingAnchorDate ?? current.starting_at;
   const startingAt = isUpgrade ? upgradeStartAt(opts.upgradeStart ?? "floor", opts.now) : nextPeriodStart(anchor, opts.now);
   const keepAutoRecharge = !!summary.autoRecharge?.enabled && PLANS[newPlan].autoRechargeAllowed;
+  // Web: Scale lleva el cobro anticipado por umbral salvo que tenga recarga automática (el setup solo lo conserva si ya estaba).
+  const keepSpendThreshold = newPlan === "scale" && !keepAutoRecharge;
+  // La API rechaza threshold billing en contratos que aún no han empezado (400 "Threshold billing cannot be configured on a
+  // contract that has not started yet"): bajadas y subidas next_hour se crean sin él y se añade con finishPendingThresholdConfig.
+  const startsNow = new Date(startingAt).getTime() <= (opts.now ?? new Date()).getTime();
   const newContractId = await createPlanContract(ctx, {
-    customerId, plan: newPlan, startingAt, billingAnchorDate: anchor, fromContractId: current.id, autoRecharge: keepAutoRecharge,
-    // Web: Scale lleva el cobro anticipado por umbral salvo que tenga recarga automática (el setup solo lo conserva si ya estaba).
-    spendThreshold: newPlan === "scale" && !keepAutoRecharge,
+    customerId, plan: newPlan, startingAt, billingAnchorDate: anchor, fromContractId: current.id,
+    autoRecharge: keepAutoRecharge && startsNow, spendThreshold: keepSpendThreshold && startsNow,
   });
-  return { kind: isUpgrade ? "upgrade" : "downgrade", fromContractId: current.id, newContractId, effectiveAt: startingAt };
+  const pendingThresholdConfig = startsNow ? undefined : keepAutoRecharge ? "auto_recharge" : keepSpendThreshold ? "spend_threshold" : undefined;
+  return { kind: isUpgrade ? "upgrade" : "downgrade", fromContractId: current.id, newContractId, effectiveAt: startingAt, ...(pendingThresholdConfig ? { pendingThresholdConfig } : {}) };
+}
+
+/**
+ * Completa un cambio de plan con `pendingThresholdConfig` cuando el contrato nuevo ya ha empezado. Idempotente: si la
+ * configuración ya existe no hace nada. Ojo: añadirla con is_enabled=true evalúa el saldo en el acto y puede cobrar.
+ */
+export async function finishPendingThresholdConfig(ctx: Ctx, customerId: string, change: Pick<PlanChangeResult, "newContractId" | "effectiveAt" | "pendingThresholdConfig">, now = new Date()) {
+  if (!change.pendingThresholdConfig || !change.newContractId) return { done: true as const, applied: false };
+  if (new Date(change.effectiveAt).getTime() > now.getTime()) return { done: false as const, applied: false, retryAt: change.effectiveAt };
+  const c = await getContract(ctx, customerId, change.newContractId);
+  const key = change.pendingThresholdConfig === "auto_recharge" ? "prepaid_balance_threshold_configuration" : "spend_threshold_configuration";
+  if (c[key]) return { done: true as const, applied: false };
+  const body: Metronome.V2.ContractEditParams = change.pendingThresholdConfig === "auto_recharge"
+    ? { customer_id: customerId, contract_id: change.newContractId, add_prepaid_balance_threshold_configuration: buildPrepaidBalanceThresholdConfig(ctx, true) }
+    : { customer_id: customerId, contract_id: change.newContractId, add_spend_threshold_configuration: buildSpendThresholdConfig(ctx, true) };
+  await ctx.client.v2.contracts.edit(body);
+  return { done: true as const, applied: true };
 }
 
 // ───────────────────────────── bundles.ts ─────────────────────────────
@@ -362,7 +443,7 @@ export async function findBundleCommit(ctx: Ctx, customerId: string, purchaseId:
 export async function buildAutoRechargeEdit(ctx: Ctx, customerId: string, contractId: string, enabled: boolean): Promise<Metronome.V2.ContractEditParams | undefined> {
   const c = await getContract(ctx, customerId, contractId);
   const s = summarizeContract(c);
-  if (enabled && s.plan in PLANS && !PLANS[s.plan as PlanId].autoRechargeAllowed) throw new Error("Auto-recharge is only available on Pro and Scale");
+  if (enabled && s.plan in PLANS && !PLANS[s.plan as PlanId].autoRechargeAllowed) throw new Error(AUTO_RECHARGE_PLANS_ERROR);
   if (enabled && s.spendThreshold?.enabled) throw new Error("Turn off the early threshold charge first (they can't be combined)");
   if (!c.prepaid_balance_threshold_configuration) {
     if (!enabled) return undefined;
@@ -372,9 +453,26 @@ export async function buildAutoRechargeEdit(ctx: Ctx, customerId: string, contra
     customer_id: customerId,
     contract_id: contractId,
     update_prepaid_balance_threshold_configuration: enabled
-      ? { is_enabled: true, threshold_amount: amt(ctx, ctx.ids.auto_recharge.threshold_eur), recharge_to_amount: amt(ctx, ctx.ids.auto_recharge.recharge_to_eur) }
+      ? ({ is_enabled: true, threshold_amount: amt(ctx, ctx.ids.auto_recharge.threshold_eur), recharge_to_amount: amt(ctx, ctx.ids.auto_recharge.recharge_to_eur), commit: buildAutoRechargeCommitTerms() } as Metronome.V2.ContractEditParams.UpdatePrepaidBalanceThresholdConfiguration)
       : { is_enabled: false },
   };
+}
+
+/** Solo sincroniza las condiciones del commit de recarga (sin tocar is_enabled). undefined si no hay config o ya están al día. */
+export async function buildAutoRechargeCommitTermsEdit(ctx: Ctx, customerId: string, contractId: string): Promise<Metronome.V2.ContractEditParams | undefined> {
+  const c = await getContract(ctx, customerId, contractId);
+  const pb = c.prepaid_balance_threshold_configuration;
+  if (!pb) return undefined;
+  const want = buildAutoRechargeCommitTerms();
+  const cur = pb.commit ?? {};
+  const upToDate = Number(cur.duration?.value) === want.duration.value && cur.duration?.unit === want.duration.unit && cur.rollover_fraction === want.rollover_fraction && cur.rate_type === want.rate_type;
+  if (upToDate) return undefined;
+  return { customer_id: customerId, contract_id: contractId, update_prepaid_balance_threshold_configuration: { commit: want } as Metronome.V2.ContractEditParams.UpdatePrepaidBalanceThresholdConfiguration };
+}
+
+export async function syncAutoRechargeCommitTerms(ctx: Ctx, customerId: string, contractId: string) {
+  const body = await buildAutoRechargeCommitTermsEdit(ctx, customerId, contractId);
+  return body ? ctx.client.v2.contracts.edit(body) : undefined;
 }
 
 export async function setAutoRecharge(ctx: Ctx, customerId: string, contractId: string, enabled: boolean) {
@@ -487,6 +585,8 @@ type RawLine = { name: string; type: string; quantity?: number; unit_price?: num
 type RawInvoice = {
   id: string; status: string; type: string; contract_id?: string; issued_at?: string; start_timestamp?: string; end_timestamp?: string;
   total: number; credit_type: { id: string; name: string }; line_items: RawLine[];
+  /** "billable" | "unbillable" (typed `unknown` in SDK 3.10.0: availability depends on the account configuration). */
+  billable_status?: unknown;
   external_invoice?: { invoice_id?: string; external_status?: string; pdf_url?: string; billing_provider_error?: string } | null;
 };
 
@@ -498,7 +598,7 @@ export function toInvoiceView(i: RawInvoice, scale = 1): InvoiceView {
       name: l.name, type: l.type, quantity: l.quantity, unitPriceEur: l.unit_price === undefined ? undefined : l.unit_price / scale, totalEur: round2(l.total / scale),
       productId: l.product_id, isProrated: l.is_prorated, appliedCommitOrCreditId: l.applied_commit_or_credit?.id, startingAt: l.starting_at, endingBefore: l.ending_before,
     })),
-    stripeInvoiceId: i.external_invoice?.invoice_id ?? undefined, stripeStatus: i.external_invoice?.external_status ?? undefined, stripeError: i.external_invoice?.billing_provider_error ?? undefined, pdfUrl: i.external_invoice?.pdf_url ?? undefined,
+    stripeInvoiceId: i.external_invoice?.invoice_id ?? undefined, stripeStatus: i.external_invoice?.external_status ?? undefined, stripeError: i.external_invoice?.billing_provider_error ?? undefined, billableStatus: typeof i.billable_status === "string" ? i.billable_status : undefined, pdfUrl: i.external_invoice?.pdf_url ?? undefined,
   };
 }
 

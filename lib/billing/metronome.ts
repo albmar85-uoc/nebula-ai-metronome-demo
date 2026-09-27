@@ -3,7 +3,7 @@
 // aquí solo se orquesta: enlace usuario ↔ IDs externos (store), idempotencia con ids de la app y mapeo a la UI.
 import Metronome from "@metronome/sdk";
 import { createHash } from "node:crypto";
-import { BUNDLES, METRICS, PLANS, eur, type MetricId, type PlanId } from "../catalog";
+import { AUTO_RECHARGE_PLANS_ERROR, BUNDLES, METRICS, PLANS, eur, type MetricId, type PlanId } from "../catalog";
 import { addAlert, addPlanEvent, addPurchase, claimRequestIds, getAlerts, getLink, getPurchase, pendingPurchases, read, resolvePurchase, saveLink, tx, findLinkByMetronomeId, type CustomerLink } from "../store";
 import { recommendPlan, usageLast30DaysFromDaily } from "./insights";
 import { capAlerts, capMessage, coversWorstCase, fitsCap, normalizeCap, periodSpend, requestCost } from "./limits";
@@ -11,7 +11,7 @@ import { loadMetronomeIds, planDisplayName, promotionFromIds } from "./metronome
 import * as H from "./metronome-helpers";
 import type { CreditGrantView, InvoiceView } from "./metronome-types";
 import { lowBalanceLimit, round, usageCost } from "./mock";
-import { PaymentFailedError, isArchivableDemoCustomer, paymentFailedMessage } from "./types";
+import { PaymentFailedError, isArchivableDemoCustomer, parseBillableStatus, paymentFailedMessage } from "./types";
 import type { Account, Alert, BillingProvider, RejectReason, CreditGrant, DailyUsage, Invoice, UsageEvent, UsageRequest } from "./types";
 
 let _client: Metronome | null = null;
@@ -44,6 +44,7 @@ export function mapInvoice(i: InvoiceView): Invoice {
     type: i.type === "USAGE" ? "usage" : "commit", periodStart: i.periodStart, periodEnd: i.periodEnd,
     lines: i.lines.map(l => ({ description: l.name, quantity: l.quantity, unitPrice: l.unitPriceEur, amount: l.totalEur, kind: kindOf(l.type) })),
     externalId: i.stripeInvoiceId, pdfUrl: i.pdfUrl, ...(failed ? { paymentError: i.stripeError ?? i.stripeStatus } : {}),
+    ...(i.billableStatus !== undefined ? { billableStatus: parseBillableStatus(i.billableStatus), billableStatusRaw: i.billableStatus } : {}),
   };
 }
 
@@ -132,8 +133,31 @@ async function resolvePending(link: CustomerLink): Promise<CustomerLink> {
   return next;
 }
 
+/**
+ * The API rejects threshold billing on a contract that hasn't started yet, so plan changes that start in the future
+ * (downgrades, next_hour upgrades) are created without it and it's added here once the contract has started.
+ * Idempotent (skips if the config already exists); on error it stays pending and is retried on the next read.
+ */
+async function finishPendingThreshold(link: CustomerLink): Promise<CustomerLink> {
+  const p = link.pendingThreshold;
+  if (!p || new Date(p.effectiveAt) > new Date()) return link;
+  try {
+    const r = await H.finishPendingThresholdConfig(ctx(), link.metronomeCustomerId, { newContractId: p.contractId, effectiveAt: p.effectiveAt, pendingThresholdConfig: p.kind });
+    if (!r.done) return link;
+    const next: CustomerLink = { ...(getLink(link.appUserId) ?? link), pendingThreshold: undefined };
+    saveLink(next);
+    cache.delete(link.appUserId);
+    if (r.applied) localAlert(link.metronomeCustomerId, "info", p.kind === "auto_recharge" ? "Auto-recharge is now active on your new plan." : "The early threshold charge is now active on your new plan.", `thr_${p.contractId}`);
+    console.log(`[metronome] pending ${p.kind} on ${p.contractId}: ${r.applied ? "added" : "already present"}`);
+    return next;
+  } catch (e) {
+    console.error("[metronome] finishPendingThreshold:", (e as Error).message);
+    return link;
+  }
+}
+
 async function toAccount(link0: CustomerLink): Promise<Account> {
-  const link = await resolvePending(link0);
+  const link = await finishPendingThreshold(await resolvePending(link0));
   const c = ctx();
   const cid = link.metronomeCustomerId;
   // Polling instead of payment_gate webhooks: a pending bundle whose commit now exists gets its bonus (idempotent).
@@ -165,8 +189,9 @@ async function toAccount(link0: CustomerLink): Promise<Account> {
     customerId: link.appUserId, name: link.name, email: link.email, plan: link.plan,
     pendingPlan: link.pendingPlan ? { plan: link.pendingPlan.plan, effectiveAt: link.pendingPlan.effectiveAt } : undefined,
     cardSaved: !!link.stripeCustomerId,
-    autoRecharge: !!summary.autoRecharge?.enabled,
+    autoRecharge: !!summary.autoRecharge?.enabled || link.pendingThreshold?.kind === "auto_recharge",
     spendThreshold: summary.spendThreshold,
+    thresholdPending: link.pendingThreshold ? { kind: link.pendingThreshold.kind, effectiveAt: link.pendingThreshold.effectiveAt } : undefined,
     blocked: !plan.overage && (bal <= 0 || accessCut),
     spendCap: link.spendCap,
     accessCut,
@@ -267,8 +292,9 @@ export const metronomeBilling: BillingProvider = {
     // Upgrades start at the next full hour (setup option "next_hour") so usage already ingested this hour isn't re-rated
     // with the new plan. METRONOME_UPGRADE_START=floor restores "starts at the current hour".
     const r = await H.changePlan(c, link.metronomeCustomerId, plan, { upgradeStart: process.env.METRONOME_UPGRADE_START === "floor" ? "floor" : "next_hour" });
+    const pendingThreshold = r.pendingThresholdConfig && r.newContractId ? { contractId: r.newContractId, effectiveAt: r.effectiveAt, kind: r.pendingThresholdConfig } : undefined;
     if (r.kind === "upgrade" && r.newContractId) {
-      saveLink({ ...link, plan, metronomeContractId: r.newContractId, pendingPlan: undefined, accessCut: false });
+      saveLink({ ...link, plan, metronomeContractId: r.newContractId, pendingPlan: undefined, pendingThreshold, accessCut: false });
       addPlanEvent(appUserId, { ts: new Date().toISOString(), kind: "upgrade", from: link.plan, to: plan, actor, contractId: r.newContractId });
       // Archiva la alerta del 20 % del plan anterior y crea la del nuevo (evaluate_on_create).
       await H.syncPlanLowBalanceAlert(c, link.metronomeCustomerId, plan).catch(e => console.error("[metronome] alerta 20 %:", e));
@@ -276,7 +302,7 @@ export const metronomeBilling: BillingProvider = {
       const when = at > new Date() ? ` ${planDisplayName(c.ids, plan)} credits and pricing apply from ${at.toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit", timeZone: "UTC" })} UTC.` : "";
       localAlert(link.metronomeCustomerId, "info", `Plan changed to ${planDisplayName(c.ids, plan)}. Your previous balance carries over.${when}`, `plan_${r.newContractId}`);
     } else if (r.kind === "downgrade" && r.newContractId) {
-      saveLink({ ...link, pendingPlan: { plan, effectiveAt: r.effectiveAt, contractId: r.newContractId } });
+      saveLink({ ...link, pendingPlan: { plan, effectiveAt: r.effectiveAt, contractId: r.newContractId }, pendingThreshold });
       addPlanEvent(appUserId, { ts: new Date().toISOString(), kind: "downgrade_scheduled", from: link.plan, to: plan, actor, effectiveAt: r.effectiveAt, contractId: r.newContractId });
       localAlert(link.metronomeCustomerId, "info", `Downgrade to ${PLANS[plan].name} scheduled for ${new Date(r.effectiveAt).toLocaleDateString("en-US", { timeZone: "UTC" })}. You'll keep your bundles, gifts and promos.`, `plan_${r.newContractId}`);
     }
@@ -303,12 +329,34 @@ export const metronomeBilling: BillingProvider = {
     return toAccount(getLink(appUserId)!);
   },
   async setAutoRecharge(appUserId, enabled) {
-    const link = mustLink(appUserId);
-    await H.setAutoRecharge(ctx(), link.metronomeCustomerId, link.metronomeContractId, enabled);
+    const link = await finishPendingThreshold(await resolvePending(mustLink(appUserId)));
+    if (enabled && !PLANS[link.plan].autoRechargeAllowed) throw new Error(AUTO_RECHARGE_PLANS_ERROR);
+    const p = link.pendingThreshold;
+    if (p?.kind === "auto_recharge") {
+      // The new contract hasn't started: nothing to edit in Metronome yet. Turning it off just drops the pending add.
+      if (!enabled) saveLink({ ...link, pendingThreshold: undefined });
+      cache.delete(appUserId);
+      return toAccount(getLink(appUserId)!);
+    }
+    const c = ctx();
+    const contract = await H.getContract(c, link.metronomeCustomerId, link.metronomeContractId);
+    if (enabled && new Date(contract.starting_at) > new Date() && !contract.prepaid_balance_threshold_configuration) {
+      if (p) throw new Error("Turn off the early threshold charge first (they can't be combined)");
+      saveLink({ ...link, pendingThreshold: { contractId: link.metronomeContractId, effectiveAt: contract.starting_at, kind: "auto_recharge" } });
+      cache.delete(appUserId);
+      return toAccount(getLink(appUserId)!);
+    }
+    await H.setAutoRecharge(c, link.metronomeCustomerId, link.metronomeContractId, enabled);
     return toAccount(link);
   },
   async setSpendThreshold(appUserId, enabled) {
-    const link = mustLink(appUserId);
+    const link = await finishPendingThreshold(await resolvePending(mustLink(appUserId)));
+    if (link.pendingThreshold) {
+      if (link.pendingThreshold.kind === "spend_threshold" && !enabled) saveLink({ ...link, pendingThreshold: undefined });
+      else if (enabled && link.pendingThreshold.kind === "auto_recharge") throw new Error("Turn off auto-recharge first (they can't be combined)");
+      cache.delete(appUserId);
+      return toAccount(getLink(appUserId)!);
+    }
     await H.setSpendThreshold(ctx(), link.metronomeCustomerId, link.metronomeContractId, enabled);
     return toAccount(link);
   },
@@ -323,7 +371,7 @@ export const metronomeBilling: BillingProvider = {
     return toAccount(link);
   },
   async ingest(appUserId, requests) {
-    const link = mustLink(appUserId);
+    const link = await finishPendingThreshold(await resolvePending(mustLink(appUserId)));
     const plan = PLANS[link.plan];
     // Corte duro Free/Pro (lo hace la app; Metronome no bloquea): webhook de saldo 0 + consulta del saldo neto.
     const blocked = { rejected: true, reason: "blocked" as RejectReason, duplicates: 0, accepted: [] as string[] };

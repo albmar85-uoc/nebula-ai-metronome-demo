@@ -79,11 +79,39 @@ test("fast-forward to month end runs the month close", async () => {
   await expect(page.getByRole("link", { name: /Scale monthly fee/ }).first()).toBeVisible();
 });
 
-test("traffic spike on Pro triggers auto-recharge; Enterprise persona opens the proposal page", async () => {
+test("Free month close: the €0 usage invoice is labelled \"Not sent to Stripe\" (billable_status unbillable)", async () => {
+  await page.goto("/dashboard");
+  await persona(/Free hobbyist near the limit/);
+  await openDrawer();
+  await drawer().getByRole("button", { name: "Fast-forward to month end" }).click();
+  await expect(drawer().getByTestId("demo-clock")).toContainText("days ahead");
+  await page.goto("/billing");
+  const row = page.getByRole("row").filter({ has: page.getByRole("link", { name: /^Free usage for / }) }).first();
+  await expect(row).toContainText("€0.00");
+  const badge = row.getByTestId("unbillable");
+  await expect(badge).toContainText("Not sent to Stripe");
+  await expect(badge).toHaveAttribute("title", /isn't sent to Stripe and there's nothing to pay/);
+  await expect(row.getByText("paid", { exact: true })).toHaveCount(0); // replaces the misleading "paid" badge
+  await row.getByRole("link", { name: /^Free usage for / }).click();
+  await expect(page.getByText("Metronome marked this invoice as unbillable").first()).toBeVisible();
+});
+
+test("traffic spike on Pro triggers auto-recharge (12-month top-ups); Free cannot enable it; Enterprise persona opens the proposal page", async () => {
   await persona(/Pro startup with auto-recharge/);
   await openDrawer();
   await drawer().getByRole("button", { name: "Traffic spike" }).click();
   await expect(toastWith(/auto-recharge charged €/)).toBeVisible();
+  // Top-ups: 12 months and carried over in full on plan change (same commit terms as the live adapter).
+  await page.goto("/billing");
+  await expect(page.getByTestId("ar-terms")).toHaveText("Each top-up is valid for 12 months and carries over in full when you change plans.");
+  await expect(page.getByRole("button", { name: "Turn off auto-recharge" })).toBeEnabled();
+  // Never on Free: toggle disabled and the API refuses (403).
+  await persona(/Free hobbyist near the limit/);
+  await page.goto("/billing");
+  await expect(page.getByRole("button", { name: "Turn on auto-recharge" })).toBeDisabled();
+  const r = await page.request.post("/api/autorecharge", { data: { enabled: true } });
+  expect(r.status()).toBe(403);
+  expect((await r.json()).error).toBe("Auto-recharge is only available on Pro and Scale");
   await persona(/Enterprise prospect/);
   await expect(page).toHaveURL(/\/enterprise/);
 });

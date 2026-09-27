@@ -75,6 +75,12 @@ await a.getByLabel("Amount (€)").fill("5"); await a.getByLabel("Reason").fill(
 await a.getByRole("button", { name: "Grant credit" }).click(); await a.getByRole("status").filter({ hasText: "granted" }).waitFor();
 await shot(a, "admin-customer");
 
+// Free month close: €0 usage invoice with billable_status "unbillable" → "Not sent to Stripe" (moves the demo clock)
+await as(p, "free");
+await control(p, { action: "fast-forward" });
+await p.goto("/billing"); await dismissModal(p); await shot(p, "billing-free-unbillable");
+await a.reload(); await a.getByRole("heading", { name: "Support actions" }).waitFor(); await shot(a, "admin-customer"); // raw billable_status
+
 // Leave the demo ready to present: fresh data, signed out.
 await control(p, { action: "reset", persona: "pro" });
 await browser.close();

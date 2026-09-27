@@ -39,7 +39,7 @@ export default function Pricing() {
         <div className="card">
           <h3>Balance bundles</h3>
           <table><tbody>{Object.values(BUNDLES).map(b => <tr key={b.id}><td>Pay {eur(b.price)}</td><td style={{ textAlign: "right" }}>Get <b>{eur(b.credit)}</b> <span className="badge ok">+{eur(b.credit - b.price)}</span></td></tr>)}</tbody></table>
-          <p className="muted" style={{ fontSize: 13 }}>Valid for 12 months and kept if you change plans. On Pro and Scale you can turn on auto-recharge: we top your balance up to {eur(AUTO_RECHARGE.rechargeTo)} whenever it drops below {eur(AUTO_RECHARGE.threshold)}.</p>
+          <p className="muted" style={{ fontSize: 13 }}>Valid for 12 months and kept if you change plans. On Pro and Scale you can turn on auto-recharge: we top your balance up to {eur(AUTO_RECHARGE.rechargeTo)} whenever it drops below {eur(AUTO_RECHARGE.threshold)}; each top-up is also valid for {AUTO_RECHARGE.validityMonths} months and carries over in full on plan changes.</p>
         </div>
       </div>
     </>

@@ -23,6 +23,10 @@ export type Invoice = {
   status: "paid" | "pending" | "draft" | "void" | "failed";
   /** Raw billing-provider error when the charge failed (admin only; customers see a generic message). */
   paymentError?: string;
+  /** Metronome billable_status. "unbillable" = not sent to the billing provider (Stripe); nothing to collect. */
+  billableStatus?: BillableStatus;
+  /** Raw billable_status as returned by Metronome (admin only). */
+  billableStatusRaw?: string;
   type?: "subscription" | "commit" | "usage" | "proration" | "threshold";
   periodStart?: string;
   periodEnd?: string;
@@ -41,6 +45,8 @@ export type Account = {
   email: string;
   plan: PlanId;
   pendingPlan?: { plan: PlanId; effectiveAt: string }; // bajadas de plan programadas al siguiente periodo
+  /** Live: auto-recharge / threshold charge carried to a plan change whose contract hasn't started yet; added at effectiveAt. */
+  thresholdPending?: { kind: "auto_recharge" | "spend_threshold"; effectiveAt: string };
   cardSaved: boolean;
   autoRecharge: boolean;
   spendThreshold?: SpendThresholdState; // solo Scale
@@ -119,3 +125,10 @@ export class DemoLimitError extends Error {
   readonly code = "demo_limit";
   constructor(readonly detail?: string) { super(DEMO_LIMIT_MESSAGE); this.name = "DemoLimitError"; }
 }
+
+export type BillableStatus = "billable" | "unbillable";
+/** Narrow Metronome's billable_status (typed `unknown` in the SDK) to the two documented values. */
+export const parseBillableStatus = (v: unknown): BillableStatus | undefined => (v === "billable" || v === "unbillable" ? v : undefined);
+/** Customer-facing label and tooltip for unbillable invoices. */
+export const UNBILLABLE_LABEL = "Not sent to Stripe";
+export const UNBILLABLE_TOOLTIP = "Metronome marked this invoice as unbillable (for example a €0 invoice fully covered by credits), so it isn't sent to Stripe and there's nothing to pay.";

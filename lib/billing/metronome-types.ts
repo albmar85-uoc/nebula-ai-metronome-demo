@@ -27,6 +27,10 @@ export interface AutoRechargeState {
   enabled: boolean;
   thresholdEur: number;
   rechargeToEur: number;
+  /** Validez de cada recarga (commit.duration; la API devuelve `value` como string → se convierte a número). */
+  commitDuration?: { value: number; unit: "DAYS" | "WEEKS" | "MONTHS" | "YEARS" };
+  rolloverFraction?: number;
+  rateType?: "LIST_RATE" | "COMMIT_RATE";
 }
 
 export interface SpendThresholdState {
@@ -55,6 +59,8 @@ export interface PlanChangeResult {
   /** Contrato nuevo (transición RENEWAL). En bajadas empieza al inicio del siguiente periodo. */
   newContractId?: string;
   effectiveAt: string;
+  /** El contrato nuevo empieza en el futuro: la API rechaza threshold billing ahí (400), se añade con finishPendingThresholdConfig. */
+  pendingThresholdConfig?: "auto_recharge" | "spend_threshold";
 }
 
 // ───────────────────────────── Saldos ─────────────────────────────
@@ -138,6 +144,8 @@ export interface InvoiceView {
   stripeStatus?: string;
   /** external_invoice.billing_provider_error (e.g. "No such customer: 'cus_…'"). */
   stripeError?: string;
+  /** Raw billable_status from Metronome ("billable" | "unbillable"; other values kept for the admin panel). */
+  billableStatus?: string;
   pdfUrl?: string;
 }
 
