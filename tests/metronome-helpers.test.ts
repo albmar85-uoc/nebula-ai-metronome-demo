@@ -74,58 +74,86 @@ describe.skipIf(!hasSetup)("parity with the setup helpers (dry-run-helpers.txt)"
     expect(H.llmRequestEvent(ctx, { transactionId: llm.transaction_id, customer: llm.customer_id, inputTokens: llm.properties.input_tokens, outputTokens: llm.properties.output_tokens, model: llm.properties.model, timestamp: llm.timestamp })).toEqual(llm);
     expect(H.imageGenerationEvent(ctx, { transactionId: img.transaction_id, customer: img.customer_id, images: img.properties.images, model: img.properties.model, timestamp: img.timestamp })).toEqual(img);
   });
-  // Cliente falso: registra las llamadas (como el dry-run del setup) y devuelve contratos simulados.
-  const fake = (contract: Record<string, unknown>, newId = "33333333-3333-4333-8333-333333333333") => {
+  // Fake client mirroring the setup's dry-run responder: records calls and returns simulated contracts.
+  const SCALE_CONTRACT = "33333333-3333-4333-8333-333333333333";
+  const ANCHOR = { frequency: "MONTHLY", billing_anchor_date: "2026-09-03T10:00:00.000Z" };
+  const AR = (commit: object = { duration: { value: "12", unit: "MONTHS" }, rollover_fraction: 1, rate_type: "LIST_RATE" }) => ({ is_enabled: true, threshold_amount: 10, recharge_to_amount: 50, commit });
+  const proContract = (commit?: object) => ({ id: CONTRACT, customer_id: CUSTOMER, starting_at: "2026-09-03T10:00:00.000Z", custom_fields: { nebula_plan: "pro" }, usage_statement_schedule: ANCHOR, prepaid_balance_threshold_configuration: AR(commit ?? { duration: { value: "12", unit: "MONTHS" }, rollover_fraction: 1 }), spend_threshold_configuration: null });
+  const legacyScale = { id: SCALE_CONTRACT, customer_id: CUSTOMER, starting_at: "2026-09-03T10:00:00.000Z", custom_fields: { nebula_plan: "scale" }, usage_statement_schedule: ANCHOR, prepaid_balance_threshold_configuration: AR(), spend_threshold_configuration: null };
+  const fake = (opts: { pro?: Record<string, unknown>; newId?: string } = {}) => {
     const calls: { op: string; body: any }[] = [];
+    const get = (id: string) => id === SCALE_CONTRACT ? legacyScale : id === CONTRACT ? (opts.pro ?? proContract())
+      : { id, customer_id: CUSTOMER, starting_at: "2026-09-25T19:00:00.000Z", custom_fields: { nebula_plan: "scale" }, prepaid_balance_threshold_configuration: null, spend_threshold_configuration: null };
     const client = {
-      v1: { contracts: { create: async (body: any) => { calls.push({ op: "create", body }); return { data: { id: newId } }; } } },
+      v1: { contracts: { create: async (body: any) => { calls.push({ op: "create", body }); return { data: { id: opts.newId ?? "44444444-4444-4444-8444-444444444444" } }; } } },
       v2: { contracts: {
-        list: async (body: any) => { calls.push({ op: "list", body }); return { data: [contract] }; },
-        retrieve: async (body: any) => { calls.push({ op: "get", body }); return { data: contract }; },
+        list: async (body: any) => { calls.push({ op: "list", body }); return { data: [opts.pro ?? proContract()] }; },
+        retrieve: async (body: any) => { calls.push({ op: "get", body }); return { data: get(body.contract_id) }; },
         edit: async (body: any) => { calls.push({ op: "edit", body }); return { data: { id: body.contract_id } }; },
       } },
     } as unknown as Metronome;
     return { ctx: { client, ids }, calls };
   };
-  const proWithAR = (commit?: object) => ({ id: CONTRACT, customer_id: CUSTOMER, starting_at: "2026-09-03T10:00:00.000Z", custom_fields: { nebula_plan: "pro" }, usage_statement_schedule: { frequency: "MONTHLY", billing_anchor_date: "2026-09-03T10:00:00.000Z" }, prepaid_balance_threshold_configuration: { is_enabled: true, threshold_amount: 10, recharge_to_amount: 50, ...(commit ? { commit } : {}) } });
+  const posts = (sec: string, p: string) => S[sec].filter(c => c.method === "POST" && c.path === p).map(c => c.body);
+  const ops = (calls: { op: string; body: any }[]) => calls.filter(x => x.op !== "list").map(x => [x.op, x.body]);
 
-  it("3a: upgrade at next hour is created WITHOUT threshold config and returns pendingThresholdConfig", async () => {
-    const { ctx: c, calls } = fake(proWithAR(), post("3a", "/v2/contracts/get").contract_id);
+  it("3a: next-hour upgrade is created WITHOUT threshold billing; both are added in ONE edit once it starts", async () => {
+    const newId = post("3a", "/v2/contracts/get").contract_id;
+    const { ctx: c, calls } = fake({ newId });
     const res = await H.changePlan(c, CUSTOMER, "scale", { now: new Date("2026-09-25T18:22:00Z"), upgradeStart: "next_hour" });
     const created = calls.find(x => x.op === "create")!.body;
     expect(created).toEqual(post("3a", "/v1/contracts/create"));
     expect(created.prepaid_balance_threshold_configuration).toBeUndefined();
     expect(created.spend_threshold_configuration).toBeUndefined();
-    expect(res).toMatchObject({ kind: "upgrade", effectiveAt: "2026-09-25T19:00:00.000Z", pendingThresholdConfig: "auto_recharge" });
-    // Antes de empezar: no llama a la API. Después: GET y, como el contrato simulado ya tiene config, no edita (igual que el dry-run).
+    expect(res).toMatchObject({ kind: "upgrade", effectiveAt: "2026-09-25T19:00:00.000Z", pendingThresholdConfig: "auto_recharge_and_spend_threshold" });
+    // Before the start: no API call.
     expect(await H.finishPendingThresholdConfig(c, CUSTOMER, res, new Date("2026-09-25T18:59:00Z"))).toEqual({ done: false, applied: false, retryAt: "2026-09-25T19:00:00.000Z" });
     const n = calls.length;
-    expect(await H.finishPendingThresholdConfig(c, CUSTOMER, res, new Date("2026-09-25T19:05:00Z"))).toEqual({ done: true, applied: false });
-    expect(calls.slice(n).map(x => [x.op, x.body])).toEqual([["get", post("3a", "/v2/contracts/get")]]);
+    expect(await H.finishPendingThresholdConfig(c, CUSTOMER, res, new Date("2026-09-25T19:05:00Z"))).toEqual({ done: true, applied: true });
+    expect(ops(calls.slice(n))).toEqual([["get", post("3a", "/v2/contracts/get")], ["edit", post("3a", "/v2/contracts/edit")]]);
   });
-  it("3a: once started and missing, finishPendingThresholdConfig adds the auto-recharge config (with commit terms)", async () => {
-    const { ctx: c, calls } = fake({ id: "33333333-3333-4333-8333-333333333333", customer_id: CUSTOMER, starting_at: "2026-09-25T19:00:00.000Z", custom_fields: { nebula_plan: "scale" } });
-    const r = await H.finishPendingThresholdConfig(c, CUSTOMER, { newContractId: "33333333-3333-4333-8333-333333333333", effectiveAt: "2026-09-25T19:00:00.000Z", pendingThresholdConfig: "auto_recharge" }, new Date("2026-09-25T19:05:00Z"));
-    expect(r).toEqual({ done: true, applied: true });
-    const edit = calls.find(x => x.op === "edit")!.body;
-    expect(edit.add_prepaid_balance_threshold_configuration).toEqual(post("2b", "/v1/contracts/create").prepaid_balance_threshold_configuration);
-    expect(edit.add_prepaid_balance_threshold_configuration.commit).toMatchObject({ duration: { value: 12, unit: "MONTHS" }, rollover_fraction: 1, rate_type: "LIST_RATE" });
+  it("3c: a Scale contract with auto-recharge always includes the €300 spend threshold too", async () => {
+    const body = H.buildPlanContractBody(ctx, { customerId: CUSTOMER, plan: "scale", startingAt: "2026-09-25T18:00:00.000Z", autoRecharge: true, now: new Date("2026-09-25T18:22:00Z") });
+    expect(body).toEqual(post("3c", "/v1/contracts/create"));
+    expect(body.spend_threshold_configuration).toMatchObject({ is_enabled: true, threshold_amount: 300, payment_gate_config: { payment_gate_type: "STRIPE", stripe_config: { payment_type: "PAYMENT_INTENT" } } });
+    expect(body.prepaid_balance_threshold_configuration).toBeDefined();
+  });
+  it("3d: future Scale signup omits thresholds; the spend threshold is added once it starts", async () => {
+    const newId = post("3d", "/v2/contracts/get").contract_id;
+    const { ctx: c, calls } = fake({ newId });
+    const r = await H.createPlanContractWithPending(c, { customerId: CUSTOMER, plan: "scale", startingAt: "2026-10-01T00:00:00.000Z", now: new Date("2026-09-25T18:22:00Z") });
+    expect(r).toEqual({ newContractId: newId, effectiveAt: "2026-10-01T00:00:00.000Z", pendingThresholdConfig: "spend_threshold" });
+    await H.finishPendingThresholdConfig(c, CUSTOMER, r, new Date("2026-10-01T00:05:00Z"));
+    expect(ops(calls)).toEqual([["create", post("3d", "/v1/contracts/create")], ["get", post("3d", "/v2/contracts/get")], ["edit", post("3d", "/v2/contracts/edit")]]);
   });
   it("5: auto-recharge disable / enable (update_ carries the commit terms inside commit)", async () => {
-    const { ctx: c, calls } = fake(proWithAR());
+    const { ctx: c, calls } = fake();
     await H.setAutoRecharge(c, CUSTOMER, CONTRACT, false);
     await H.setAutoRecharge(c, CUSTOMER, CONTRACT, true);
+    expect(calls.filter(x => x.op === "edit").map(x => x.body)).toEqual(posts("5", "/v2/contracts/edit"));
+  });
+  it("5a: on a legacy Scale contract without spend threshold, toggling auto-recharge adds the €300 threshold in the same edit (never disables it)", async () => {
+    const { ctx: c, calls } = fake();
+    await H.setAutoRecharge(c, CUSTOMER, SCALE_CONTRACT, false);
+    await H.setAutoRecharge(c, CUSTOMER, SCALE_CONTRACT, true);
     const edits = calls.filter(x => x.op === "edit").map(x => x.body);
-    expect(edits).toEqual([post("5", "/v2/contracts/edit", 0), post("5", "/v2/contracts/edit", 1)]);
+    expect(edits).toEqual(posts("5a", "/v2/contracts/edit"));
+    for (const e of edits) expect(e.update_spend_threshold_configuration?.is_enabled).not.toBe(false);
   });
   it("5b: sync only the recharge-commit terms (no is_enabled); no-op when already up to date", async () => {
-    const { ctx: c, calls } = fake(proWithAR());
+    const { ctx: c, calls } = fake();
     await H.syncAutoRechargeCommitTerms(c, CUSTOMER, CONTRACT);
-    expect(calls.map(x => [x.op, x.body])).toEqual([["get", post("5b", "/v2/contracts/get")], ["edit", post("5b", "/v2/contracts/edit")]]);
-    // La API devuelve duration.value como string: se normaliza con Number() y no se re-edita.
-    const up = fake(proWithAR({ duration: { value: "12", unit: "MONTHS" }, rollover_fraction: 1, rate_type: "LIST_RATE" }));
+    expect(ops(calls)).toEqual([["get", post("5b", "/v2/contracts/get")], ["edit", post("5b", "/v2/contracts/edit")]]);
+    // The API returns duration.value as a string: normalized with Number(), not re-edited.
+    const up = fake({ pro: proContract({ duration: { value: "12", unit: "MONTHS" }, rollover_fraction: 1, rate_type: "LIST_RATE" }) });
     expect(await H.buildAutoRechargeCommitTermsEdit(up.ctx, CUSTOMER, CONTRACT)).toBeUndefined();
-    expect(H.summarizeContract(proWithAR({ duration: { value: "12", unit: "MONTHS" }, rollover_fraction: 1, rate_type: "LIST_RATE" }) as any).autoRecharge).toMatchObject({ commitDuration: { value: 12, unit: "MONTHS" }, rolloverFraction: 1, rateType: "LIST_RATE" });
+    expect(H.summarizeContract(legacyScale as any).autoRecharge).toMatchObject({ commitDuration: { value: 12, unit: "MONTHS" }, rolloverFraction: 1, rateType: "LIST_RATE" });
+  });
+  it("10b: spend threshold on a Scale contract that also has auto-recharge (they coexist); turning it off on Scale is refused", async () => {
+    const { ctx: c, calls } = fake();
+    await H.setSpendThreshold(c, CUSTOMER, SCALE_CONTRACT, true);
+    expect(ops(calls)).toEqual([["get", post("10b", "/v2/contracts/get")], ["edit", post("10b", "/v2/contracts/edit")]]);
+    await expect(H.setSpendThreshold(c, CUSTOMER, SCALE_CONTRACT, false)).rejects.toThrow("always on for the Scale plan");
   });
   it("30-day usage: window at UTC midnight and the 3 metrics", () => {
     const want = post("12", "/v1/usage");

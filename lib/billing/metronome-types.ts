@@ -52,6 +52,9 @@ export interface PlanContractSummary {
   spendThreshold?: SpendThresholdState;
 }
 
+/** Threshold billing still to add once a future-starting contract has started (the API rejects it before: 400). */
+export type PendingThresholdConfig = "auto_recharge" | "spend_threshold" | "auto_recharge_and_spend_threshold";
+
 /** Resultado de un cambio de plan. */
 export interface PlanChangeResult {
   kind: "upgrade" | "downgrade" | "same";
@@ -60,7 +63,7 @@ export interface PlanChangeResult {
   newContractId?: string;
   effectiveAt: string;
   /** El contrato nuevo empieza en el futuro: la API rechaza threshold billing ahí (400), se añade con finishPendingThresholdConfig. */
-  pendingThresholdConfig?: "auto_recharge" | "spend_threshold";
+  pendingThresholdConfig?: PendingThresholdConfig;
 }
 
 // ───────────────────────────── Saldos ─────────────────────────────

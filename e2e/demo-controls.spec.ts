@@ -62,6 +62,13 @@ test("traffic spike on Scale triggers the early usage charge (spend threshold)",
   await expect(toastWith(/Usage spike: your overage reached €300\.00/)).toBeVisible(); // the alert itself, as a toast
   await page.goto("/billing");
   await expect(page.getByRole("link", { name: /Early charge: overage reached €300\.00/ })).toBeVisible();
+  // Scale: the €300 threshold charge is always on (no turn-off), and auto-recharge can be turned on alongside it.
+  await expect(page.getByTestId("st-always-badge")).toHaveText("Always on");
+  await expect(page.getByRole("button", { name: "Turn off early threshold charge" })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Turn on auto-recharge" })).toBeEnabled();
+  const off = await page.request.post("/api/spend-threshold", { data: { enabled: false } });
+  expect(off.status()).toBe(400);
+  expect((await off.json()).error).toBe("The early threshold charge is always on for the Scale plan");
 });
 
 test("fast-forward to month end runs the month close", async () => {

@@ -49,6 +49,8 @@ export const BUNDLES: Record<BundleId, { id: BundleId; price: number; credit: nu
 export const AUTO_RECHARGE = { threshold: 10, rechargeTo: 50, validityMonths: 12 };
 /** Condiciones del commit de recarga (van DENTRO de `commit`; a nivel superior la API responde 200 pero las ignora). */
 /** Auto-recharge only on plans with autoRechargeAllowed (Pro and Scale), never Free: checked in the UI, the API route and both providers. */
+/** Scale always has the €300 early threshold charge (agreed with the Metronome expert, 2026-09-27), with or without auto-recharge. */
+export const SPEND_THRESHOLD_ALWAYS_ON_ERROR = "The early threshold charge is always on for the Scale plan";
 export const AUTO_RECHARGE_PLANS_ERROR = "Auto-recharge is only available on Pro and Scale";
 export const isAutoRechargeAllowed = (plan: string) => plan in PLANS && PLANS[plan as PlanId].autoRechargeAllowed;
 export const AUTO_RECHARGE_COMMIT_TERMS = { duration: { value: AUTO_RECHARGE.validityMonths, unit: "MONTHS" as "DAYS" | "WEEKS" | "MONTHS" | "YEARS" }, rolloverFraction: 1, rateType: "LIST_RATE" as "LIST_RATE" | "COMMIT_RATE" };

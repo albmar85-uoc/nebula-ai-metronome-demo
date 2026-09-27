@@ -46,7 +46,7 @@ export type Account = {
   plan: PlanId;
   pendingPlan?: { plan: PlanId; effectiveAt: string }; // bajadas de plan programadas al siguiente periodo
   /** Live: auto-recharge / threshold charge carried to a plan change whose contract hasn't started yet; added at effectiveAt. */
-  thresholdPending?: { kind: "auto_recharge" | "spend_threshold"; effectiveAt: string };
+  thresholdPending?: { kind: "auto_recharge" | "spend_threshold" | "auto_recharge_and_spend_threshold"; effectiveAt: string };
   cardSaved: boolean;
   autoRecharge: boolean;
   spendThreshold?: SpendThresholdState; // solo Scale

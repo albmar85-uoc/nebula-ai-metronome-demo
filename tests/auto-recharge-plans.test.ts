@@ -53,3 +53,20 @@ describe("auto-recharge only on Pro and Scale, never Free", () => {
     expect(state.calls).toEqual([false, true]);
   });
 });
+
+describe("pending threshold billing on a contract that hasn't started", () => {
+  it("toggling auto-recharge only changes the auto-recharge part; the Scale spend threshold stays pending", () => {
+    expect(H.pendingWithAutoRecharge("spend_threshold", true)).toBe("auto_recharge_and_spend_threshold");
+    expect(H.pendingWithAutoRecharge("auto_recharge_and_spend_threshold", false)).toBe("spend_threshold");
+    expect(H.pendingWithAutoRecharge("auto_recharge", false)).toBeUndefined();
+    expect(H.pendingWithAutoRecharge(undefined, true)).toBe("auto_recharge");
+  });
+  it("what a plan contract defers when it starts in the future", () => {
+    const now = new Date("2026-09-27T18:27:00Z");
+    expect(H.pendingThresholdConfigFor({ customerId: "c", plan: "scale", startingAt: "2026-09-27T19:00:00.000Z", autoRecharge: true, now })).toBe("auto_recharge_and_spend_threshold");
+    expect(H.pendingThresholdConfigFor({ customerId: "c", plan: "scale", startingAt: "2026-09-27T19:00:00.000Z", now })).toBe("spend_threshold");
+    expect(H.pendingThresholdConfigFor({ customerId: "c", plan: "pro", startingAt: "2026-10-27T18:00:00.000Z", autoRecharge: true, now })).toBe("auto_recharge");
+    expect(H.pendingThresholdConfigFor({ customerId: "c", plan: "free", startingAt: "2026-10-27T18:00:00.000Z", now })).toBeUndefined();
+    expect(H.pendingThresholdConfigFor({ customerId: "c", plan: "scale", startingAt: "2026-09-27T18:00:00.000Z", autoRecharge: true, now })).toBeUndefined();
+  });
+});

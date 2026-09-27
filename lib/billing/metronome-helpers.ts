@@ -3,12 +3,12 @@
 // cuerpo contra los tipos generados del OpenAPI). Si el experto cambia un helper, replicar el cambio aquí.
 // Tabla helper → endpoint → método del SDK: README del setup, sección 5.
 import Metronome from "@metronome/sdk";
-import { AUTO_RECHARGE, AUTO_RECHARGE_COMMIT_TERMS, AUTO_RECHARGE_PLANS_ERROR, BUNDLES, LOW_BALANCE_RATIO, PLANS, PRIORITIES, SPEND_THRESHOLD, type BundleId, type MetricId, type PlanId } from "../catalog";
+import { AUTO_RECHARGE, AUTO_RECHARGE_COMMIT_TERMS, AUTO_RECHARGE_PLANS_ERROR, SPEND_THRESHOLD_ALWAYS_ON_ERROR, BUNDLES, LOW_BALANCE_RATIO, PLANS, PRIORITIES, SPEND_THRESHOLD, type BundleId, type MetricId, type PlanId } from "../catalog";
 import { round2 } from "./insights";
 import type { MetronomeIds, SubscriptionPlanKey } from "./metronome-config";
 import type {
   AutoRechargeState, BalanceSummary, CreditGrantView, CustomerRef, GrantKind, InvoiceLineView, InvoiceView, MetronomeWebhookEvent,
-  BalanceAlertProperties, PaymentGateProperties, PlanChangeResult, PlanContractSummary, PromoCreditResult, SpendThresholdState,
+  BalanceAlertProperties, PaymentGateProperties, PendingThresholdConfig, PlanChangeResult, PlanContractSummary, PromoCreditResult, SpendThresholdState,
   UpcomingInvoicePreview, UsageLast30Days, WebhookAction, BundlePurchaseResult, MetricUsage,
 } from "./metronome-types";
 import { METRICS } from "../catalog";
@@ -70,7 +70,12 @@ export async function createCustomerWithStripe(ctx: Ctx, input: CreateCustomerIn
 
 export type PlanContractOptions = {
   customerId: string; plan: PlanId; startingAt?: string; billingAnchorDate?: string; fromContractId?: string;
-  autoRecharge?: boolean; spendThreshold?: boolean; uniquenessKey?: string;
+  autoRecharge?: boolean;
+  /** Scale ALWAYS gets the €300 spend threshold (agreed with the expert 2026-09-27), with or without auto-recharge: ignored on Scale; `true` on other plans throws. */
+  spendThreshold?: boolean;
+  uniquenessKey?: string;
+  /** "Now" to decide whether the contract has started (threshold billing is omitted on future-starting contracts). */
+  now?: Date;
 };
 
 /** customerBalances/list (contracts.listBalances) rejects limit > 25 (undocumented; seen in the sandbox). The SDK iterator paginates. */
@@ -142,14 +147,42 @@ export function buildZeroOverageOverrides(ctx: Ctx, plan: PlanId, startingAt: st
   ];
 }
 
+/** Scale always carries the spend threshold (agreed 2026-09-27: with or without auto-recharge). */
+export const planRequiresSpendThreshold = (plan: string) => plan === "scale";
+/** Does the contract start after `now`? The API rejects threshold billing (prepaid AND spend) on contracts that haven't started. */
+export const startsInFuture = (startingAt: string, now = new Date()) => new Date(startingAt).getTime() > now.getTime();
+/** Threshold configs a plan contract carries (independent of its start). Auto-recharge and spend threshold can coexist (verified live). */
+export function wantedThresholdConfigs(plan: PlanId, autoRecharge: boolean) {
+  return { autoRecharge: autoRecharge && PLANS[plan].autoRechargeAllowed, spendThreshold: planRequiresSpendThreshold(plan) };
+}
+function toPending(w: { autoRecharge: boolean; spendThreshold: boolean }): PendingThresholdConfig | undefined {
+  return w.autoRecharge && w.spendThreshold ? "auto_recharge_and_spend_threshold" : w.autoRecharge ? "auto_recharge" : w.spendThreshold ? "spend_threshold" : undefined;
+}
+export const pendingHasAutoRecharge = (k?: PendingThresholdConfig) => k === "auto_recharge" || k === "auto_recharge_and_spend_threshold";
+export const pendingHasSpendThreshold = (k?: PendingThresholdConfig) => k === "spend_threshold" || k === "auto_recharge_and_spend_threshold";
+/** Pending state after the customer toggles auto-recharge on a contract that hasn't started (nothing to edit in Metronome yet). */
+export function pendingWithAutoRecharge(k: PendingThresholdConfig | undefined, enabled: boolean): PendingThresholdConfig | undefined {
+  return toPending({ autoRecharge: enabled, spendThreshold: pendingHasSpendThreshold(k) });
+}
+
+/** What must be added later if the contract starts in the future (undefined if it starts now). */
+export function pendingThresholdConfigFor(o: PlanContractOptions): PendingThresholdConfig | undefined {
+  const startingAt = o.startingAt ?? floorToHour(o.now);
+  if (!startsInFuture(startingAt, o.now)) return undefined;
+  return toPending(wantedThresholdConfigs(o.plan, !!o.autoRecharge));
+}
+
 /** Cuerpo exacto de POST /v1/contracts/create para un plan (= buildPlanContractBody del setup). */
 export function buildPlanContractBody(ctx: Ctx, o: PlanContractOptions): Metronome.V1.ContractCreateParams {
   const plan = PLANS[o.plan];
   const eurId = ctx.ids.credit_types.EUR;
-  const startingAt = o.startingAt ?? floorToHour();
+  const startingAt = o.startingAt ?? floorToHour(o.now);
   if (o.autoRecharge && !plan.autoRechargeAllowed) throw new Error(`Auto-recharge is not available on ${plan.name}`);
-  if (o.spendThreshold && o.plan !== "scale") throw new Error("spend_threshold_configuration is only offered on Scale");
-  if (o.spendThreshold && o.autoRecharge) throw new Error("Use auto-recharge (prepaid) OR spend threshold (early overage charge), not both on the same contract");
+  if (o.spendThreshold && !planRequiresSpendThreshold(o.plan)) throw new Error("The early threshold charge is only available on Scale");
+  // Auto-recharge and the spend threshold CAN coexist (verified live 2026-09-27, on create and on edit); Scale always has the spend threshold.
+  const want = wantedThresholdConfigs(o.plan, !!o.autoRecharge);
+  // 400 "Threshold billing cannot be configured on a contract that has not started yet" (prepaid AND spend, verified live): omit both.
+  const deferred = startsInFuture(startingAt, o.now);
   const multiplier = round2(1 - plan.discount);
   return {
     customer_id: o.customerId,
@@ -191,10 +224,18 @@ export function buildPlanContractBody(ctx: Ctx, o: PlanContractOptions): Metrono
     ...(plan.zeroOverageGuarantee
       ? { overrides: buildZeroOverageOverrides(ctx, o.plan, startingAt) }
       : multiplier < 1 ? { overrides: [{ starting_at: startingAt, type: "MULTIPLIER" as const, multiplier, applicable_product_tags: [USAGE_TAG] }] } : {}),
-    ...(o.autoRecharge ? { prepaid_balance_threshold_configuration: buildPrepaidBalanceThresholdConfig(ctx) } : {}),
-    ...(o.spendThreshold ? { spend_threshold_configuration: buildSpendThresholdConfig(ctx) } : {}),
+    ...(want.autoRecharge && !deferred ? { prepaid_balance_threshold_configuration: buildPrepaidBalanceThresholdConfig(ctx) } : {}),
+    ...(want.spendThreshold && !deferred ? { spend_threshold_configuration: buildSpendThresholdConfig(ctx) } : {}),
     ...(o.fromContractId ? { transition: { type: "RENEWAL" as const, from_contract_id: o.fromContractId } } : {}),
   };
+}
+
+/** Creates a plan contract and reports what threshold billing is still pending if it starts in the future (= setup helper). */
+export async function createPlanContractWithPending(ctx: Ctx, o: PlanContractOptions) {
+  const effectiveAt = o.startingAt ?? floorToHour(o.now);
+  const newContractId = await createPlanContract(ctx, { ...o, startingAt: effectiveAt });
+  const pendingThresholdConfig = pendingThresholdConfigFor({ ...o, startingAt: effectiveAt });
+  return { newContractId, effectiveAt, ...(pendingThresholdConfig ? { pendingThresholdConfig } : {}) };
 }
 
 /** 409 (uniqueness_key ya usada) ⇒ el contrato ya existe: se busca y se devuelve (reintento idempotente). */
@@ -329,16 +370,12 @@ export async function changePlan(ctx: Ctx, customerId: string, newPlan: PlanId, 
   const anchor = summary.billingAnchorDate ?? current.starting_at;
   const startingAt = isUpgrade ? upgradeStartAt(opts.upgradeStart ?? "floor", opts.now) : nextPeriodStart(anchor, opts.now);
   const keepAutoRecharge = !!summary.autoRecharge?.enabled && PLANS[newPlan].autoRechargeAllowed;
-  // Web: Scale lleva el cobro anticipado por umbral salvo que tenga recarga automática (el setup solo lo conserva si ya estaba).
-  const keepSpendThreshold = newPlan === "scale" && !keepAutoRecharge;
-  // La API rechaza threshold billing en contratos que aún no han empezado (400 "Threshold billing cannot be configured on a
-  // contract that has not started yet"): bajadas y subidas next_hour se crean sin él y se añade con finishPendingThresholdConfig.
-  const startsNow = new Date(startingAt).getTime() <= (opts.now ?? new Date()).getTime();
-  const newContractId = await createPlanContract(ctx, {
-    customerId, plan: newPlan, startingAt, billingAnchorDate: anchor, fromContractId: current.id,
-    autoRecharge: keepAutoRecharge && startsNow, spendThreshold: keepSpendThreshold && startsNow,
-  });
-  const pendingThresholdConfig = startsNow ? undefined : keepAutoRecharge ? "auto_recharge" : keepSpendThreshold ? "spend_threshold" : undefined;
+  // Scale ALWAYS gets the spend threshold (buildPlanContractBody adds it), also together with auto-recharge. Contracts that
+  // start in the future (downgrades, next_hour upgrades) are created without threshold billing (API 400) and the pending part
+  // is returned for finishPendingThresholdConfig.
+  const o: PlanContractOptions = { customerId, plan: newPlan, startingAt, billingAnchorDate: anchor, fromContractId: current.id, autoRecharge: keepAutoRecharge, now: opts.now };
+  const newContractId = await createPlanContract(ctx, o);
+  const pendingThresholdConfig = pendingThresholdConfigFor(o);
   return { kind: isUpgrade ? "upgrade" : "downgrade", fromContractId: current.id, newContractId, effectiveAt: startingAt, ...(pendingThresholdConfig ? { pendingThresholdConfig } : {}) };
 }
 
@@ -350,13 +387,30 @@ export async function finishPendingThresholdConfig(ctx: Ctx, customerId: string,
   if (!change.pendingThresholdConfig || !change.newContractId) return { done: true as const, applied: false };
   if (new Date(change.effectiveAt).getTime() > now.getTime()) return { done: false as const, applied: false, retryAt: change.effectiveAt };
   const c = await getContract(ctx, customerId, change.newContractId);
-  const key = change.pendingThresholdConfig === "auto_recharge" ? "prepaid_balance_threshold_configuration" : "spend_threshold_configuration";
-  if (c[key]) return { done: true as const, applied: false };
-  const body: Metronome.V2.ContractEditParams = change.pendingThresholdConfig === "auto_recharge"
-    ? { customer_id: customerId, contract_id: change.newContractId, add_prepaid_balance_threshold_configuration: buildPrepaidBalanceThresholdConfig(ctx, true) }
-    : { customer_id: customerId, contract_id: change.newContractId, add_spend_threshold_configuration: buildSpendThresholdConfig(ctx, true) };
-  await ctx.client.v2.contracts.edit(body);
+  const wantAutoRecharge = change.pendingThresholdConfig !== "spend_threshold";
+  // Scale: the spend threshold is ALWAYS ensured, even if the pending state only says "auto_recharge" (older results).
+  const isScale = planRequiresSpendThreshold(c.custom_fields?.nebula_plan ?? "");
+  const fields = {
+    ...(wantAutoRecharge && !c.prepaid_balance_threshold_configuration ? { add_prepaid_balance_threshold_configuration: buildPrepaidBalanceThresholdConfig(ctx, true) } : {}),
+    ...(isScale
+      ? buildEnsureScaleSpendThresholdFields(ctx, c)
+      : change.pendingThresholdConfig !== "auto_recharge" && !c.spend_threshold_configuration ? { add_spend_threshold_configuration: buildSpendThresholdConfig(ctx, true) } : {}),
+  };
+  if (!Object.keys(fields).length) return { done: true as const, applied: false };
+  await ctx.client.v2.contracts.edit({ customer_id: customerId, contract_id: change.newContractId, ...fields });
   return { done: true as const, applied: true };
+}
+
+/**
+ * /v2/contracts/edit fields that leave the Scale spend threshold active at €300: add_ if missing, update_ (is_enabled true,
+ * amount) if disabled or different, {} if already right or not Scale. Idempotent.
+ */
+export function buildEnsureScaleSpendThresholdFields(ctx: Ctx, c: ContractV2, thresholdEur = ctx.ids.spend_threshold?.scale_threshold_eur ?? SPEND_THRESHOLD.scaleThreshold): Partial<Metronome.V2.ContractEditParams> {
+  if (!planRequiresSpendThreshold(c.custom_fields?.nebula_plan ?? "")) return {};
+  const st = c.spend_threshold_configuration;
+  if (!st) return { add_spend_threshold_configuration: buildSpendThresholdConfig(ctx, true, thresholdEur) };
+  if (!st.is_enabled || st.threshold_amount !== amt(ctx, thresholdEur)) return { update_spend_threshold_configuration: { is_enabled: true, threshold_amount: amt(ctx, thresholdEur) } };
+  return {};
 }
 
 // ───────────────────────────── bundles.ts ─────────────────────────────
@@ -444,10 +498,11 @@ export async function buildAutoRechargeEdit(ctx: Ctx, customerId: string, contra
   const c = await getContract(ctx, customerId, contractId);
   const s = summarizeContract(c);
   if (enabled && s.plan in PLANS && !PLANS[s.plan as PlanId].autoRechargeAllowed) throw new Error(AUTO_RECHARGE_PLANS_ERROR);
-  if (enabled && s.spendThreshold?.enabled) throw new Error("Turn off the early threshold charge first (they can't be combined)");
+  // Scale: the spend threshold is kept (or repaired) in the same edit; other plans are untouched.
+  const spend = buildEnsureScaleSpendThresholdFields(ctx, c);
   if (!c.prepaid_balance_threshold_configuration) {
-    if (!enabled) return undefined;
-    return { customer_id: customerId, contract_id: contractId, add_prepaid_balance_threshold_configuration: buildPrepaidBalanceThresholdConfig(ctx, true) };
+    if (!enabled) return Object.keys(spend).length ? { customer_id: customerId, contract_id: contractId, ...spend } : undefined;
+    return { customer_id: customerId, contract_id: contractId, add_prepaid_balance_threshold_configuration: buildPrepaidBalanceThresholdConfig(ctx, true), ...spend };
   }
   return {
     customer_id: customerId,
@@ -455,6 +510,7 @@ export async function buildAutoRechargeEdit(ctx: Ctx, customerId: string, contra
     update_prepaid_balance_threshold_configuration: enabled
       ? ({ is_enabled: true, threshold_amount: amt(ctx, ctx.ids.auto_recharge.threshold_eur), recharge_to_amount: amt(ctx, ctx.ids.auto_recharge.recharge_to_eur), commit: buildAutoRechargeCommitTerms() } as Metronome.V2.ContractEditParams.UpdatePrepaidBalanceThresholdConfiguration)
       : { is_enabled: false },
+    ...spend,
   };
 }
 
@@ -484,7 +540,7 @@ export async function buildSpendThresholdEdit(ctx: Ctx, customerId: string, cont
   const c = await getContract(ctx, customerId, contractId);
   const s = summarizeContract(c);
   if (enabled && s.plan !== "scale") throw new Error("The early threshold charge is only available on Scale");
-  if (enabled && s.autoRecharge?.enabled) throw new Error("Turn off auto-recharge first (they can't be combined)");
+  if (!enabled && planRequiresSpendThreshold(s.plan)) throw new Error(SPEND_THRESHOLD_ALWAYS_ON_ERROR);
   if (!c.spend_threshold_configuration) {
     if (!enabled) return undefined;
     return { customer_id: customerId, contract_id: contractId, add_spend_threshold_configuration: buildSpendThresholdConfig(ctx, true, thresholdEur) };

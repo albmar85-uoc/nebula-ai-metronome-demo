@@ -3,7 +3,7 @@
 // aquí solo se orquesta: enlace usuario ↔ IDs externos (store), idempotencia con ids de la app y mapeo a la UI.
 import Metronome from "@metronome/sdk";
 import { createHash } from "node:crypto";
-import { AUTO_RECHARGE_PLANS_ERROR, BUNDLES, METRICS, PLANS, eur, type MetricId, type PlanId } from "../catalog";
+import { AUTO_RECHARGE_PLANS_ERROR, BUNDLES, SPEND_THRESHOLD, SPEND_THRESHOLD_ALWAYS_ON_ERROR, METRICS, PLANS, eur, type MetricId, type PlanId } from "../catalog";
 import { addAlert, addPlanEvent, addPurchase, claimRequestIds, getAlerts, getLink, getPurchase, pendingPurchases, read, resolvePurchase, saveLink, tx, findLinkByMetronomeId, type CustomerLink } from "../store";
 import { recommendPlan, usageLast30DaysFromDaily } from "./insights";
 import { capAlerts, capMessage, coversWorstCase, fitsCap, normalizeCap, periodSpend, requestCost } from "./limits";
@@ -147,7 +147,10 @@ async function finishPendingThreshold(link: CustomerLink): Promise<CustomerLink>
     const next: CustomerLink = { ...(getLink(link.appUserId) ?? link), pendingThreshold: undefined };
     saveLink(next);
     cache.delete(link.appUserId);
-    if (r.applied) localAlert(link.metronomeCustomerId, "info", p.kind === "auto_recharge" ? "Auto-recharge is now active on your new plan." : "The early threshold charge is now active on your new plan.", `thr_${p.contractId}`);
+    if (r.applied) {
+      const what = [H.pendingHasAutoRecharge(p.kind) && "Auto-recharge", (H.pendingHasSpendThreshold(p.kind) || link.plan === "scale") && "the early threshold charge"].filter(Boolean).join(" and ");
+      localAlert(link.metronomeCustomerId, "info", `${what.charAt(0).toUpperCase()}${what.slice(1)} ${what.includes(" and ") ? "are" : "is"} now active on your new plan.`, `thr_${p.contractId}`);
+    }
     console.log(`[metronome] pending ${p.kind} on ${p.contractId}: ${r.applied ? "added" : "already present"}`);
     return next;
   } catch (e) {
@@ -189,8 +192,8 @@ async function toAccount(link0: CustomerLink): Promise<Account> {
     customerId: link.appUserId, name: link.name, email: link.email, plan: link.plan,
     pendingPlan: link.pendingPlan ? { plan: link.pendingPlan.plan, effectiveAt: link.pendingPlan.effectiveAt } : undefined,
     cardSaved: !!link.stripeCustomerId,
-    autoRecharge: !!summary.autoRecharge?.enabled || link.pendingThreshold?.kind === "auto_recharge",
-    spendThreshold: summary.spendThreshold,
+    autoRecharge: !!summary.autoRecharge?.enabled || H.pendingHasAutoRecharge(link.pendingThreshold?.kind),
+    spendThreshold: summary.spendThreshold ?? (H.pendingHasSpendThreshold(link.pendingThreshold?.kind) ? { enabled: true, thresholdEur: c.ids.spend_threshold?.scale_threshold_eur ?? SPEND_THRESHOLD.scaleThreshold, paymentGate: "STRIPE" } : undefined),
     thresholdPending: link.pendingThreshold ? { kind: link.pendingThreshold.kind, effectiveAt: link.pendingThreshold.effectiveAt } : undefined,
     blocked: !plan.overage && (bal <= 0 || accessCut),
     spendCap: link.spendCap,
@@ -332,17 +335,13 @@ export const metronomeBilling: BillingProvider = {
     const link = await finishPendingThreshold(await resolvePending(mustLink(appUserId)));
     if (enabled && !PLANS[link.plan].autoRechargeAllowed) throw new Error(AUTO_RECHARGE_PLANS_ERROR);
     const p = link.pendingThreshold;
-    if (p?.kind === "auto_recharge") {
-      // The new contract hasn't started: nothing to edit in Metronome yet. Turning it off just drops the pending add.
-      if (!enabled) saveLink({ ...link, pendingThreshold: undefined });
-      cache.delete(appUserId);
-      return toAccount(getLink(appUserId)!);
-    }
     const c = ctx();
-    const contract = await H.getContract(c, link.metronomeCustomerId, link.metronomeContractId);
-    if (enabled && new Date(contract.starting_at) > new Date() && !contract.prepaid_balance_threshold_configuration) {
-      if (p) throw new Error("Turn off the early threshold charge first (they can't be combined)");
-      saveLink({ ...link, pendingThreshold: { contractId: link.metronomeContractId, effectiveAt: contract.starting_at, kind: "auto_recharge" } });
+    // Contract not started yet (the API rejects threshold billing there): only the pending state changes; the spend
+    // threshold part (Scale) stays pending either way.
+    const contract = p ? undefined : await H.getContract(c, link.metronomeCustomerId, link.metronomeContractId);
+    if (p || (contract && H.startsInFuture(contract.starting_at))) {
+      const kind = H.pendingWithAutoRecharge(p?.kind, enabled);
+      saveLink({ ...link, pendingThreshold: kind ? { contractId: link.metronomeContractId, effectiveAt: p?.effectiveAt ?? contract!.starting_at, kind } : undefined });
       cache.delete(appUserId);
       return toAccount(getLink(appUserId)!);
     }
@@ -351,12 +350,9 @@ export const metronomeBilling: BillingProvider = {
   },
   async setSpendThreshold(appUserId, enabled) {
     const link = await finishPendingThreshold(await resolvePending(mustLink(appUserId)));
-    if (link.pendingThreshold) {
-      if (link.pendingThreshold.kind === "spend_threshold" && !enabled) saveLink({ ...link, pendingThreshold: undefined });
-      else if (enabled && link.pendingThreshold.kind === "auto_recharge") throw new Error("Turn off auto-recharge first (they can't be combined)");
-      cache.delete(appUserId);
-      return toAccount(getLink(appUserId)!);
-    }
+    if (!enabled && H.planRequiresSpendThreshold(link.plan)) throw new Error(SPEND_THRESHOLD_ALWAYS_ON_ERROR);
+    if (enabled && !H.planRequiresSpendThreshold(link.plan)) throw new Error("The early threshold charge is only available on Scale");
+    if (link.pendingThreshold) return toAccount(link); // Scale: already pending, added when the contract starts
     await H.setSpendThreshold(ctx(), link.metronomeCustomerId, link.metronomeContractId, enabled);
     return toAccount(link);
   },

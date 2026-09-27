@@ -225,13 +225,21 @@ describe("Scale: overage and early threshold charge", () => {
     expect(draftInvoice(r.account).amount).toBe(90); // 390 − 300 ya cobrados
     expect(r.account.alerts.some(x => x.type === "payment" && x.message.includes("charged it early"))).toBe(true);
   });
-  it("auto-recharge and threshold charge are mutually exclusive", async () => {
+  it("Scale always keeps the €300 threshold charge; auto-recharge coexists with it and never turns it off", async () => {
     const a = await b.signup({ name: "S", email: "s@x", plan: "scale" });
-    await expect(b.setAutoRecharge(a.customerId, true)).rejects.toThrow(/threshold/);
-    await b.setSpendThreshold(a.customerId, false);
-    const r = await b.setAutoRecharge(a.customerId, true);
+    let r = await b.setAutoRecharge(a.customerId, true);
     expect(r.autoRecharge).toBe(true);
-    await expect(b.setSpendThreshold(a.customerId, true)).rejects.toThrow(/auto-recharge/);
+    expect(r.spendThreshold).toMatchObject({ enabled: true, thresholdEur: 300 });
+    r = await b.setAutoRecharge(a.customerId, false);
+    expect(r.spendThreshold?.enabled).toBe(true);
+    await expect(b.setSpendThreshold(a.customerId, false)).rejects.toThrow("The early threshold charge is always on for the Scale plan");
+  });
+  it("upgrade Pro with auto-recharge → Scale: keeps auto-recharge AND gets the threshold charge", async () => {
+    const a = await b.signup({ name: "P", email: "p@x", plan: "pro" });
+    await b.setAutoRecharge(a.customerId, true);
+    const r = await b.changePlan(a.customerId, "scale");
+    expect(r.autoRecharge).toBe(true);
+    expect(r.spendThreshold).toMatchObject({ enabled: true, thresholdEur: 300 });
   });
   it("Scale only", async () => {
     const a = await b.signup({ name: "A", email: "a@x", plan: "pro" });

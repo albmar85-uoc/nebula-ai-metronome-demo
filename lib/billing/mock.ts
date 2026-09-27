@@ -6,7 +6,7 @@
 //  - bundles = commit con payment gate; el regalo se concede solo tras el webhook payment_gate.payment_status=paid;
 //  - recarga automática "hasta 50 €" (Free/Pro/Scale), cobro anticipado por umbral de gasto (Scale), promos con caducidad;
 //  - alertas del 20 % (por plan) y de 0 €, corte de acceso en Free/Pro; ingesta idempotente por id de petición.
-import { AUTO_RECHARGE, AUTO_RECHARGE_PLANS_ERROR, BUNDLES, LOW_BALANCE_RATIO, METRICS, PLANS, PROMOTIONS, SPEND_THRESHOLD, eur, type BundleId, type MetricId, type PlanId } from "../catalog";
+import { AUTO_RECHARGE, AUTO_RECHARGE_PLANS_ERROR, SPEND_THRESHOLD_ALWAYS_ON_ERROR, BUNDLES, LOW_BALANCE_RATIO, METRICS, PLANS, PROMOTIONS, SPEND_THRESHOLD, eur, type BundleId, type MetricId, type PlanId } from "../catalog";
 import { addPlanEvent, addPurchase, getAccount, getAlerts, getPurchase, pendingPurchases, resolvePurchase, saveAccount, tx } from "../store";
 import { coversWorstCase, capAlerts, capMessage, fitsCap, normalizeCap, periodSpend, requestCost } from "./limits";
 import { recommendPlan, round2, usageLast30DaysFromDaily } from "./insights";
@@ -393,7 +393,8 @@ export const mockBilling: BillingProvider = {
       addPlanEvent(customerId, { ts: nowIso(), kind: "upgrade", from: a.plan, to: plan, actor });
       a.plan = plan;
       a.pendingPlan = undefined;
-      if (plan === "scale" && !a.autoRecharge) a.spendThreshold = { enabled: true, thresholdEur: SPEND_THRESHOLD.scaleThreshold, paymentGate: "STRIPE" };
+      // Scale ALWAYS has the €300 early threshold charge, with or without auto-recharge (agreed with the expert, 2026-09-27).
+      if (plan === "scale") a.spendThreshold = { enabled: true, thresholdEur: SPEND_THRESHOLD.scaleThreshold, paymentGate: "STRIPE" };
       a.accessCut = false;
       pushAlert(a, "info", `Plan changed to ${newP.name}: +${eur(newCredits)} in credits; your previous balance carries over. Low-balance alert updated to ${eur(lowBalanceLimit(a))}.`);
       // Alerta del 20 % re-sincronizada (evaluate_on_create): si ya estás por debajo del nuevo umbral, avisa ya.
@@ -431,7 +432,6 @@ export const mockBilling: BillingProvider = {
   async setAutoRecharge(customerId, enabled) {
     const a = load(customerId);
     if (enabled && !PLANS[a.plan].autoRechargeAllowed) throw new Error(AUTO_RECHARGE_PLANS_ERROR);
-    if (enabled && a.spendThreshold?.enabled) throw new Error("Turn off the early threshold charge first (they can't be combined)");
     a.autoRecharge = enabled;
     if (enabled) evaluate(a, balance(a));
     saveAccount(a);
@@ -440,7 +440,7 @@ export const mockBilling: BillingProvider = {
   async setSpendThreshold(customerId, enabled) {
     const a = load(customerId);
     if (enabled && a.plan !== "scale") throw new Error("The early threshold charge is only available on Scale");
-    if (enabled && a.autoRecharge) throw new Error("Turn off auto-recharge first (they can't be combined)");
+    if (!enabled && a.plan === "scale") throw new Error(SPEND_THRESHOLD_ALWAYS_ON_ERROR);
     a.spendThreshold = { enabled, thresholdEur: a.spendThreshold?.thresholdEur ?? SPEND_THRESHOLD.scaleThreshold, paymentGate: "STRIPE" };
     if (enabled) spendThresholdCheck(a);
     saveAccount(a);
